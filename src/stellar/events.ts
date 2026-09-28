@@ -1,5 +1,12 @@
 import { scValToNative, type rpc, type xdr } from '@stellar/stellar-sdk'
 
+/**
+ * The @stellar/stellar-sdk version against which the event fixtures and decodeEvent
+ * wire assumptions were captured and verified (issue #206). If the installed SDK version
+ * drifts from this recorded version, wire shape compatibility must be re-verified.
+ */
+export const FIXTURE_SDK_VERSION = '16.0.1'
+
 // The complete catalog of events the OurDAO contract publishes, keyed by the
 // first-topic symbol. `fields` names the positional entries of the published
 // data tuple so downstream handlers read `data.borrower` instead of `data[1]`.

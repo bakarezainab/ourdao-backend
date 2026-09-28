@@ -1,6 +1,6 @@
 {
   "name": "ourdao-backend",
-  "version": "0.1.0",
+  "version": "0.2.0",
   "private": true,
   "description": "OurDAO backend — off-chain indexer + read API for the Stellar/Soroban lending DAO.",
   "license": "MIT",

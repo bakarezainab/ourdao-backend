@@ -123,6 +123,42 @@ jobs:
             SOURCE_COMMIT=${{ github.sha }}
             BUILD_DATE=${{ github.event.repository.updated_at }}
 
+      # Vulnerability scan (#212): scan the built image with Trivy.
+      # Publishes full findings to GitHub Actions step summary and enforces
+      # a failure policy on HIGH and CRITICAL vulnerabilities.
+      - name: Scan image with Trivy (capture summary)
+        uses: aquasecurity/trivy-action@0.28.0
+        with:
+          image-ref: ${{ env.IMAGE }}
+          format: 'table'
+          output: 'trivy-results.txt'
+          severity: 'CRITICAL,HIGH'
+          exit-code: '0'
+          trivyignores: '.trivyignore'
+
+      - name: Publish vulnerability scan results to summary
+        if: always()
+        run: |
+          if [ -f trivy-results.txt ]; then
+            {
+              echo '### Container Vulnerability Scan (Trivy)'
+              echo ''
+              echo '```text'
+              cat trivy-results.txt
+              echo '```'
+            } >> "$GITHUB_STEP_SUMMARY"
+          fi
+
+      - name: Enforce vulnerability policy (fail on HIGH/CRITICAL)
+        uses: aquasecurity/trivy-action@0.28.0
+        with:
+          image-ref: ${{ env.IMAGE }}
+          format: 'table'
+          severity: 'CRITICAL,HIGH'
+          exit-code: '1'
+          ignore-unfixed: false
+          trivyignores: '.trivyignore'
+
       # The `cp src/db/schema.sql … && cp -r src/db/migrations …` build step is
       # the failure most likely to reach production silently: add a migration,
       # forget the copy, image starts and dies at runtime while CI is green.

@@ -13,8 +13,11 @@ This document covers everything needed to run `ourdao-backend` outside a laptop:
 - [Full configuration reference](#full-configuration-reference)
 - [Database connections](#database-connections)
 - [Backup and recovery](#backup-and-recovery)
+- [Release management and migrations](#release-management-and-migrations)
+- [Container security and image scanning](#container-security-and-image-scanning)
 - [Redeploying the contract](#redeploying-the-contract)
 - [Operations](#operations)
+- [Soroban RPC wire smoke testing](#soroban-rpc-wire-smoke-testing)
 - [Related repos](#related-repos)
 
 ---
@@ -229,6 +232,34 @@ docker run --env-file .env ourdao-backend node dist/indexer/reindex.js
 
 ---
 
+## Release management and migrations
+
+Before deploying an image upgrade or pulling a new release, operators must consult [CHANGELOG.md](../CHANGELOG.md).
+
+Releases follow [Semantic Versioning](https://semver.org/). Each release entry in the changelog explicitly flags operational prerequisites:
+- **`[Migration: <file>]`** — Release carries one or more database migrations. Schema migrations run automatically on boot (serialized by a Postgres advisory lock), but operators should be aware of additions or table alterations before rollout.
+- **`[Requires Reindex]`** — Release alters event folding logic, fixes a previous event decoding defect, or backfills derived tables. After starting the new version, operators must run `npm run reindex` (or `docker run --env-file .env ourdao-backend node dist/indexer/reindex.js`) to re-sync derived tables with the raw event log.
+
+The `/version` endpoint reports the active build's version, commit sha, and build date:
+```bash
+curl http://localhost:4000/version
+# {"version":"0.2.0","commit":"...","buildDate":"..."}
+```
+
+---
+
+## Container security and image scanning
+
+To guarantee build reproducibility and protect the production environment against base-image vulnerabilities:
+
+- **Pinned Digest Base Image**: The `Dockerfile` pins the base image by immutable SHA256 digest (`node:20-alpine@sha256:...`) rather than a mutable floating tag. Dependabot monitors Docker ecosystem updates weekly and opens PRs when updated digests are available.
+- **Vulnerability Scanning**: In CI, the `docker-build` job automatically scans the built container image with Trivy.
+- **Failure Policy**: Builds fail on any detected `HIGH` or `CRITICAL` severity vulnerability with available fixes.
+- **Allowlist Policy**: If an upstream vulnerability cannot yet be patched or represents an acceptable risk, it must be documented in [`.trivyignore`](../.trivyignore) including the CVE ID, explanation, upstream tracking link, and an expiration date.
+- **Job Summary Reporting**: Detailed scan tables are published directly to the GitHub Actions Job Summary on every run.
+
+---
+
 ## Redeploying the contract
 
 The OurDAO contract has no upgrade path. Every fix is a new deployment with a new `CONTRACT_ID`. Proposal and loan ids restart at 0, so pointing an existing database at a new contract would silently merge two deployments' history.
@@ -328,6 +359,49 @@ docker run --env-file .env ourdao-backend node dist/indexer/reindex.js
 ```
 
 This is safe to run at any time — it is idempotent and the result is always consistent with the raw log. It is the recovery path for reorgs, quarantined events (after fixing the handler), and any derived-table corruption. See [`docs/events-storage.md`](./events-storage.md) for expected run times at various log sizes.
+
+---
+
+## Soroban RPC wire smoke testing
+
+To verify that `@stellar/stellar-sdk` and the event catalog continue to match the actual wire format returned by Soroban RPC without depending on fixtures, an opt-in smoke test is provided in `test/soroban-rpc-smoke.test.ts`.
+
+This test does not run during regular pull requests to avoid public RPC latency or rate-limiting from blocking CI, but runs on a scheduled CI workflow and can be triggered on demand.
+
+### Running against a live testnet contract
+```bash
+RUN_RPC_SMOKE=true \
+CONTRACT_ID=C... \
+SOROBAN_RPC_URL=https://soroban-testnet.stellar.org \
+npm run test:smoke
+```
+
+### Running against a local standalone network
+To smoke test in an isolated offline environment using Stellar's official standalone container:
+
+```bash
+# 1. Start local standalone network with Soroban RPC enabled
+docker run --rm -d \
+  -p 8000:8000 \
+  --name stellar-standalone \
+  stellar/quickstart:testing \
+  --standalone \
+  --enable-soroban-rpc
+
+# 2. Wait for RPC readiness
+curl -s -X POST http://localhost:8000/soroban/rpc \
+  -H "Content-Type: application/json" \
+  -d '{"jsonrpc":"2.0","id":1,"method":"getHealth"}'
+
+# 3. Deploy/invoke the contract or pass your deployed test contract id
+RUN_RPC_SMOKE=true \
+CONTRACT_ID=<DEPLOYED_CONTRACT_ID> \
+SOROBAN_RPC_URL=http://localhost:8000/soroban/rpc \
+npm run test:smoke
+
+# 4. Tear down container
+docker stop stellar-standalone
+```
 
 ---
 

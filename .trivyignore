@@ -1,0 +1,11 @@
+# Trivy vulnerability allowlist for ourdao-backend container image.
+#
+# POLICY:
+# Every ignored CVE must:
+# 1. Have a clear rationale explaining why it is an acceptable risk or a false positive.
+# 2. Link to an upstream tracking issue or advisory.
+# 3. Specify an expiration date (format: exp:YYYY-MM-DD) after which it must be re-evaluated.
+#
+# Example:
+# # CVE-2026-XXXX: Busybox unaligned read, not reachable via node runtime. Tracking: #000
+# # CVE-2026-XXXX exp:2026-12-31

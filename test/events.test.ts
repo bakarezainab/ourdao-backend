@@ -1,6 +1,8 @@
+import { readFileSync } from 'node:fs'
+import { join } from 'node:path'
 import { describe, expect, it } from 'vitest'
 import { Address, Keypair, nativeToScVal, xdr, type rpc } from '@stellar/stellar-sdk'
-import { ADMIN_EVENT_SYMBOLS, EVENT_FIELDS, decodeEvent, toJsonSafe } from '../src/stellar/events.js'
+import { ADMIN_EVENT_SYMBOLS, EVENT_FIELDS, FIXTURE_SDK_VERSION, decodeEvent, toJsonSafe } from '../src/stellar/events.js'
 
 const ADDR = Keypair.random().publicKey()
 
@@ -135,3 +137,16 @@ describe('toJsonSafe', () => {
     expect(toJsonSafe(null)).toBe(null)
   })
 })
+
+describe('Soroban RPC wire fixture version (#206)', () => {
+  it('records the SDK version the fixtures were captured against', () => {
+    expect(FIXTURE_SDK_VERSION).toBe('16.0.1')
+    const pkg = JSON.parse(readFileSync(join(process.cwd(), 'package.json'), 'utf-8')) as {
+      dependencies: Record<string, string>
+    }
+    const sdkPin = pkg.dependencies['@stellar/stellar-sdk']
+    expect(sdkPin).toBeDefined()
+    expect(sdkPin).toContain('16.0.1')
+  })
+})
+
