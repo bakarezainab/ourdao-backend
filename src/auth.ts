@@ -8,6 +8,16 @@ import { config } from './config.js'
 export const NONCE_TIMESTAMP_HEX_LEN = 12
 /** Random bytes after the prefix, so prefix + random is 64 hex chars. */
 const NONCE_RANDOM_BYTES = 26
+/** Total nonce length: NONCE_TIMESTAMP_HEX_LEN (12) + NONCE_RANDOM_BYTES*2 (52) = 64 */
+const NONCE_TOTAL_HEX_LEN = NONCE_TIMESTAMP_HEX_LEN + NONCE_RANDOM_BYTES * 2
+/**
+ * Pre-check regex: the nonce must be exactly NONCE_TOTAL_HEX_LEN lowercase hex
+ * characters. Issue #352: Number.parseInt(hex, 16) silently returns NaN for
+ * non-hex input, so the age comparison becomes NaN > maxAge || NaN < 0 → false,
+ * letting malformed nonces pass the cheap pre-check and reach the nonce store.
+ * Validating with a regex first guarantees the subsequent parseInt is safe.
+ */
+const NONCE_FORMAT_RE = new RegExp(`^[0-9a-f]{${NONCE_TOTAL_HEX_LEN}}$`)
 const MAX_NONCES_PER_ADDRESS = 100
 
 // Authentication failure counters (issue #183, #403)
@@ -631,6 +641,32 @@ export async function authenticateRequest(
   if (!sig.ok) {
     failureTracker?.recordFailure(address)
     return { authenticated: false, status: sig.status, error: sig.error }
+  }
+
+  // Issue #352: validate nonce format before hitting the store.
+  // Number.parseInt(hex, 16) never throws — it returns NaN for non-hex input, which
+  // makes age > maxAge || age < 0 silently false, so malformed nonces would pass the
+  // cheap pre-check and reach signature verification and the nonce store. Guard with
+  // a regex first so the subsequent parseInt is known-safe, and reject anything that
+  // does not match the expected format immediately without touching the store.
+  if (!NONCE_FORMAT_RE.test(nonce)) {
+    logger?.warn(`[auth] authentication failed: reason=invalid_nonce address=${truncateAddress(address)} detail=malformed_format`)
+    authStats.verificationsFailed.invalidNonce++
+    failureTracker?.recordFailure(address)
+    return { authenticated: false, status: 401, error: 'Invalid or expired nonce' }
+  }
+
+  // Cheap timestamp pre-check (issue #266): reject nonces whose embedded timestamp
+  // is outside the configured TTL window without a database round-trip. The regex
+  // above guarantees the slice is valid hex, so parseInt cannot return NaN here.
+  const timestampMs = Number.parseInt(nonce.slice(0, NONCE_TIMESTAMP_HEX_LEN), 16)
+  const maxAge = config.db.nonceTtlMs
+  const age = Date.now() - timestampMs
+  if (!Number.isFinite(timestampMs) || age > maxAge || age < 0) {
+    logger?.warn(`[auth] authentication failed: reason=invalid_nonce address=${truncateAddress(address)} detail=expired_or_future age_ms=${age}`)
+    authStats.verificationsFailed.invalidNonce++
+    failureTracker?.recordFailure(address)
+    return { authenticated: false, status: 401, error: 'Invalid or expired nonce' }
   }
 
   // Check if the nonce is valid and hasn't been used
