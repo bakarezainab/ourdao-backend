@@ -15,7 +15,6 @@ import { clientErrorHandler, frameworkErrors, registerErrorHandling } from './er
 import { registerRoutes } from './routes/index.js'
 import { registerStreamEndpoint } from './stream.js'
 import { MemoryNonceStore, PostgresNonceStore, type NonceStore } from '../auth.js'
-import { register as metricsRegister } from './metrics.js'
 import { readFileSync } from 'fs'
 import { dirname, join } from 'path'
 import { fileURLToPath } from 'url'
@@ -276,8 +275,13 @@ export async function buildServer(opts: BuildServerOptions = {}): Promise<Fastif
     keyGenerator: (req: { ip?: string; socket?: { remoteAddress?: string } }) => req.ip ?? req.socket?.remoteAddress ?? 'unknown',
     addHeadersOnExceeding: { 'x-ratelimit-limit': true, 'x-ratelimit-remaining': true, 'x-ratelimit-reset': true },
     addHeaders: { 'x-ratelimit-limit': true, 'x-ratelimit-remaining': true, 'x-ratelimit-reset': true, 'retry-after': true },
-    allowList: (req: { url: string }) =>
-      req.url === '/health' || req.url === '/health/dependencies' || req.url === '/ready' || req.url === '/version' || req.url === '/metrics',
+    allowList: (req: { url: string }) => {
+      // Issue #353: compare against the path only, ignoring any query string.
+      // req.url === '/metrics' would miss '/metrics?x=1', leaving it rate-limited
+      // while '/metrics' itself is exempt — an asymmetry that invites bypass.
+      const path = req.url.split('?')[0]
+      return path === '/health' || path === '/health/dependencies' || path === '/ready' || path === '/version'
+    },
   })
 
   // ── Routes (including /api/stream — issue #158) ──
@@ -410,13 +414,22 @@ export async function buildServer(opts: BuildServerOptions = {}): Promise<Fastif
     }
   )
 
-  // ── Prometheus metrics (issues #528, #529) ──
-  app.get('/metrics', async (_req, reply) => {
-    reply.header('Content-Type', metricsRegister.contentType)
-    return metricsRegister.metrics()
-  })
+  // ── Prometheus metrics (issue #274, #353) ─────────────────────────────────
+  // Issue #353: /metrics was in the rate-limit allowList alongside /health and
+  // /ready, making it exempt from throttling and publicly accessible with no
+  // credential. Two changes here:
+  //   1. /metrics is removed from the allowList (it now counts against the
+  //      shared per-IP limit).
+  //   2. When METRICS_TOKEN is set, the endpoint requires
+  //      "Authorization: Bearer <token>". A missing or wrong token returns 401.
+  //      Operators who run Prometheus on a trusted internal network and do not
+  //      set METRICS_TOKEN get the same open behaviour as before, while those
+  //      who expose the port publicly can opt in to token protection.
+  //
+  // Note: the duplicate bare `app.get('/metrics', …)` that existed above this
+  // block (using the `register` alias) has been removed; both references now
+  // point at `metricsRegistry`, which is the same object.
 
-  // ── Version endpoint (issue #64) — build metadata ──
   app.get(
     '/version',
     {
@@ -442,7 +455,10 @@ export async function buildServer(opts: BuildServerOptions = {}): Promise<Fastif
     })
   )
 
-  // ── Prometheus metrics (issue #274) — SSE connection count + message throughput ──
+  // ── Prometheus metrics (issue #274, #353) — SSE connection count + message throughput ──
+  // Issue #353: when METRICS_TOKEN is set in env, require "Authorization: Bearer <token>".
+  // Callers without a token (or with the wrong one) get 401. Operators on a trusted
+  // internal network who do not set METRICS_TOKEN get the same open behaviour as before.
   app.get(
     '/metrics',
     {
@@ -452,7 +468,8 @@ export async function buildServer(opts: BuildServerOptions = {}): Promise<Fastif
         description:
           'Prometheus exposition format (text/plain). Exposes ourdao_sse_connections (gauge: currently open SSE connections), ' +
           'ourdao_sse_connections_total (counter: SSE connections opened, ever), ourdao_sse_messages_total (counter: SSE messages ' +
-          'written, labeled by event_type), plus Node.js default process/runtime metrics from prom-client.',
+          'written, labeled by event_type), plus Node.js default process/runtime metrics from prom-client. ' +
+          'When METRICS_TOKEN is set, requires "Authorization: Bearer <token>".',
         response: {
           200: {
             content: {
@@ -461,10 +478,21 @@ export async function buildServer(opts: BuildServerOptions = {}): Promise<Fastif
               },
             },
           },
+          401: {
+            type: 'object',
+            properties: { error: { type: 'string' } },
+          },
         },
       },
     },
-    async (_req, reply) => {
+    async (req, reply) => {
+      const metricsToken = config.http.metricsToken
+      if (metricsToken) {
+        const authHeader = req.headers.authorization ?? ''
+        if (authHeader !== `Bearer ${metricsToken}`) {
+          return reply.code(401).send({ error: 'Unauthorized' })
+        }
+      }
       reply.header('Content-Type', metricsRegistry.contentType)
       return metricsRegistry.metrics()
     }
