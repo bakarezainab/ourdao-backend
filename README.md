@@ -2,7 +2,7 @@
   <img src="assets/logo.png" alt="OurDAO logo" width="96" />
 </p>
 
-# OurDAO Backend
+# OurDAO Backend.
 
 [![CI](https://github.com/ourdao/ourdao-backend/actions/workflows/ci.yml/badge.svg)](https://github.com/ourdao/ourdao-backend/actions/workflows/ci.yml)
 [![License: MIT](https://img.shields.io/badge/License-MIT-yellow.svg)](./LICENSE)
