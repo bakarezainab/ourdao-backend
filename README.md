@@ -137,6 +137,7 @@ All configuration is environment-driven — see [`.env.example`](./.env.example)
 | `STREAM_RETRY_AFTER_SECONDS` | `Retry-After` value (seconds) on stream-cap `503` responses (default 30). |
 | `TRUST_PROXY` | Set to `"true"` behind a reverse proxy so rate limits apply per client IP. |
 | `LOG_LEVEL` | Pino log level for the Fastify server (`fatal`, `error`, `warn`, `info`, `debug`, `trace`, `silent`). Default `info` (logs a line per request). `silent` suppresses all request logging, which the test harness uses. |
+| `METRICS_TOKEN` | Optional bearer token for `GET /metrics`. When set, requests without `Authorization: Bearer <token>` are rejected with 401. Leave unset for internal/trusted deployments where the port is not publicly reachable. Issue #353. |
 | `TEST_DATABASE_URL` | Separate database `npm test` runs against — never the dev DB. |
 
 **Note:** The indexer (worker process) uses `console.log`/`console.error` directly and does not respect `LOG_LEVEL`. Its output is always shown regardless of this setting.

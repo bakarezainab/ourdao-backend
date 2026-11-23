@@ -5,10 +5,40 @@
  * The API process exposes them at GET /metrics; the worker process currently
  * does not serve its own /metrics endpoint (noted in issue #528 as future work).
  */
-import { Counter, Histogram, Registry } from 'prom-client'
+import { Counter, Gauge, Histogram, Registry } from 'prom-client'
 
 // Single registry for all metrics
 export const register = new Registry()
+
+/**
+ * Alias for `register`. Code that was written against an older name
+ * (`metricsRegistry`) imports this; both names refer to the same instance.
+ */
+export const metricsRegistry = register
+
+// ── SSE connection metrics (issue #274) ──
+
+/** Gauge: currently open SSE connections. */
+export const sseConnectionsGauge = new Gauge({
+  name: 'ourdao_sse_connections',
+  help: 'Currently open SSE connections',
+  registers: [register],
+})
+
+/** Counter: SSE connections opened, ever. */
+export const sseConnectionsTotal = new Counter({
+  name: 'ourdao_sse_connections_total',
+  help: 'Total SSE connections opened',
+  registers: [register],
+})
+
+/** Counter: SSE messages written, labeled by event_type. */
+export const sseMessagesTotal = new Counter({
+  name: 'ourdao_sse_messages_total',
+  help: 'Total SSE messages sent, by event type',
+  labelNames: ['event_type'],
+  registers: [register],
+})
 
 /**
  * Issue #528: Count of RPC rate-limit (429) retries, labeled by operation.
