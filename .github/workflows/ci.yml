@@ -67,6 +67,12 @@ jobs:
       - name: Schema drift audit
         run: npm run audit:schema-drift
 
+      # Issue #537: catch a new migration that jumps version numbers or fills
+      # a deliberate gap before merge, complementing the runtime duplicate-
+      # version check in src/db/migrate.ts's assertNoDuplicateVersions.
+      - name: Migration version sequence check
+        run: npm run check:migrations
+
       # Runs the full suite with v8 coverage instrumentation and enforces the
       # thresholds in vitest.config.ts (#79). Replaces the plain `npm test`
       # step — same tests, plus the report. Observed runtime delta on CI: a

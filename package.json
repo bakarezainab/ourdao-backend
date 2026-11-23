@@ -2,7 +2,7 @@
   "name": "ourdao-backend",
   "version": "0.2.0",
   "private": true,
-  "description": "OurDAO backend — off-chain indexer + read API for the Stellar/Soroban lending DAO.",
+  "description": "OurDAO backend \u2014 off-chain indexer + read API for the Stellar/Soroban lending DAO.",
   "license": "MIT",
   "type": "module",
   "engines": {
@@ -28,6 +28,7 @@
     "openapi:validate": "npm run openapi:generate && git diff --exit-code openapi.json",
     "license:check": "tsx scripts/check-licenses.ts",
     "audit:schema-drift": "tsx scripts/audit-schema-drift.ts",
+    "check:migrations": "tsx scripts/check-sequential-migrations.ts",
     "clean:test-schemas": "tsx scripts/clean-test-schemas.ts"
   },
   "dependencies": {
