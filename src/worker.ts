@@ -1,73 +1,13 @@
 import './worker-role.js'
 import { initTelemetry, shutdownTelemetry } from './telemetry.js'
 import { migrate } from './db/migrate.js'
-import { pool, createDedicatedClient } from './db/index.js'
+import { pool } from './db/index.js'
 import { runIndexer, stopIndexer } from './indexer/poller.js'
 import { startWorkerDiagnosticsServer } from './indexer/worker-diagnostics.js'
-import { config } from './config.js'
-import { runMaintenance, logMaintenanceResult } from './db/maintenance.js'
+import { runMaintenanceLoop } from './maintenance-loop.js'
 import { closeRedis } from './cache/redis.js'
 
 const SHUTDOWN_TIMEOUT_MS = 10_000
-
-// Issue #279: periodic VACUUM ANALYZE + expired-auth_nonces sweep, run
-// alongside the indexer loop on its own abort-aware timer — a self-
-// rescheduling setTimeout loop (matching the style already used by the
-// indexer's own poll loop in src/indexer/poller.ts), so a maintenance run
-// that takes a while never overlaps with the next scheduled one, and the
-// loop stops promptly on shutdown rather than leaving a dangling timer.
-function runMaintenanceLoop(signal: AbortSignal): { stopped: Promise<void> } {
-  let resolveStopped: () => void
-  const stopped = new Promise<void>((resolve) => {
-    resolveStopped = resolve
-  })
-
-  async function tick(): Promise<void> {
-    if (signal.aborted) {
-      resolveStopped()
-      return
-    }
-
-    const client = createDedicatedClient()
-    try {
-      await client.connect()
-      const result = await runMaintenance(client)
-      logMaintenanceResult(result)
-    } catch (err) {
-      // A maintenance run failing outright (e.g. can't even connect) must
-      // never crash the worker or block the indexer (issue #279) — log and
-      // wait for the next scheduled run.
-      console.error('[maintenance] run failed unexpectedly:', err)
-    } finally {
-      try {
-        await client.end()
-      } catch {
-        // Ignore — the connection may already be gone.
-      }
-    }
-
-    if (signal.aborted) {
-      resolveStopped()
-      return
-    }
-
-    const timer = setTimeout(() => void tick(), config.maintenance.intervalMs)
-    // Don't hold the process open on this timer alone — mirrors the
-    // indexer's own backoff-sleep timers (issue #121).
-    if (timer.unref) timer.unref()
-    signal.addEventListener(
-      'abort',
-      () => {
-        clearTimeout(timer)
-        resolveStopped()
-      },
-      { once: true }
-    )
-  }
-
-  void tick()
-  return { stopped }
-}
 
 async function main(): Promise<void> {
   // Issue #288: registered before anything else runs, matching OpenTelemetry's
