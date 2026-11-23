@@ -1,4 +1,4 @@
-import { afterAll, beforeEach, describe, expect, it } from 'vitest'
+import { afterAll, beforeEach, describe, expect, it, vi } from 'vitest'
 import { replayAllUnresolvedFailedEvents } from '../src/indexer/replay.js'
 import { query } from '../src/db/index.js'
 import { closeDb, resetDb } from './db.js'
@@ -36,5 +36,34 @@ describe('replayAllUnresolvedFailedEvents', () => {
     )
     await query(`INSERT INTO failed_events (event_id, symbol, ledger, error) VALUES ('4-0', 'unknown_evt', 100, 'boom')`)
     expect(await replayAllUnresolvedFailedEvents()).toEqual([{ eventId: '4-0', status: 'replayed' }])
+  })
+
+  it('emits a [replay] progress line when the interval elapses (issue #523)', async () => {
+    for (const id of ['5-0', '6-0']) {
+      await query(
+        `INSERT INTO events (id, ledger, closed_at, contract_id, symbol, topics, data)
+         VALUES ($1, 100, now(), 'CTEST', 'unknown_evt', '[]', '[]')`,
+        [id]
+      )
+      await query(`INSERT INTO failed_events (event_id, symbol, ledger, error) VALUES ($1, 'unknown_evt', 100, 'boom')`, [id])
+    }
+
+    const logs: string[] = []
+    const spy = vi.spyOn(console, 'log').mockImplementation((...args: unknown[]) => {
+      logs.push(String(args[0]))
+    })
+    try {
+      // Pass 0 ms interval so every event triggers a log line
+      await replayAllUnresolvedFailedEvents(0)
+    } finally {
+      spy.mockRestore()
+    }
+
+    const progressLines = logs.filter((l) => l.startsWith('[replay] progress:'))
+    expect(progressLines.length).toBeGreaterThan(0)
+    expect(progressLines[0]).toMatch(/\[replay\] progress: \d+\/\d+ event\(s\)/)
+    expect(progressLines[0]).toMatch(/ev\/s/)
+    expect(progressLines[0]).toMatch(/elapsed/)
+    expect(progressLines[0]).toMatch(/ETA/)
   })
 })
