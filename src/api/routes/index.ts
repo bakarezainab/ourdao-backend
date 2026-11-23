@@ -24,6 +24,7 @@ import type {
   TimelineEntry,
 } from '../../types.js'
 import { authenticateRequest, isValidStellarAddress, type NonceStore } from '../../auth.js'
+import { getTracer, requestSpan, type Span } from '../../telemetry.js'
 
 // Small helper: clamp a `limit` query param to a sane range.
 function limit(v: unknown, def = 50, max = 200): number {
@@ -159,7 +160,7 @@ export async function registerRoutes(app: FastifyInstance, opts: { nonceStore: N
     try {
       const nonce = await nonceStore.issue(address)
       return { nonce }
-    } catch (error) {
+    } catch {
       // Nonce store capacity exceeded
       return reply.code(503).send({ error: 'Service temporarily unavailable' })
     }
@@ -196,6 +197,13 @@ export async function registerRoutes(app: FastifyInstance, opts: { nonceStore: N
       return reply.code(400).send({ error: 'invalid Stellar address' })
     }
 
+    // Issue #530: the summary is one wide CTE with several sub-queries, so a
+    // child span around it is the useful granularity (the request span alone
+    // can't say which query in the handler took the time).
+    const querySpan = getTracer().startSpan('members.summary', {
+      parent: requestSpan(req),
+      attributes: { 'db.system': 'postgresql' },
+    })
     const summary = await queryOne<{ summary: MemberSummary }>(`
       WITH m AS (
         SELECT * FROM members WHERE address = $1
@@ -239,7 +247,7 @@ export async function registerRoutes(app: FastifyInstance, opts: { nonceStore: N
           )
         ) as summary
       FROM m
-    `, [req.params.address])
+    `, [req.params.address]).finally(() => querySpan.end())
 
     if (!summary || !summary.summary) return reply.code(404).send({ error: 'member not found' })
 
@@ -636,7 +644,14 @@ export async function registerRoutes(app: FastifyInstance, opts: { nonceStore: N
   // never leaks across tests or restarts.
   let statsCache: { at: number; value: DAOStats } | null = null
 
-  async function computeStats(): Promise<DAOStats> {
+  async function computeStats(parent?: Span): Promise<DAOStats> {
+    // Issue #530: one child span around the aggregate — it is the heaviest
+    // single query in the API, and the request span alone can't distinguish
+    // it from the (cheap) cache-hit path.
+    const statsSpan = getTracer().startSpan('stats.aggregate', {
+      parent,
+      attributes: { 'db.system': 'postgresql' },
+    })
     const row = await queryOne<{
       total_members: string
       active_members: string
@@ -681,7 +696,7 @@ export async function registerRoutes(app: FastifyInstance, opts: { nonceStore: N
          (SELECT last_ledger FROM indexer_cursor WHERE id = 1)                     AS last_ledger,
          (SELECT observed_tip_ledger FROM indexer_cursor WHERE id = 1)             AS observed_tip_ledger,
          (SELECT updated_at FROM indexer_cursor WHERE id = 1)                      AS cursor_updated_at`
-    )
+    ).finally(() => statsSpan.end())
     const cursorUpdatedAt = row?.cursor_updated_at
     const secondsSinceUpdate = cursorUpdatedAt
       ? Math.floor((Date.now() - new Date(cursorUpdatedAt).getTime()) / 1000)
@@ -720,13 +735,13 @@ export async function registerRoutes(app: FastifyInstance, opts: { nonceStore: N
     }
   }
 
-  app.get('/stats', async (_req, reply): Promise<DAOStats> => {
+  app.get('/stats', async (req, reply): Promise<DAOStats> => {
     const ttl = config.http.statsCacheMs
     reply.header('Cache-Control', `public, max-age=${Math.max(0, Math.floor(ttl / 1000))}`)
     if (statsCache && Date.now() - statsCache.at < ttl) {
       return statsCache.value
     }
-    const value = await computeStats()
+    const value = await computeStats(requestSpan(req))
     statsCache = { at: Date.now(), value }
     return value
   })

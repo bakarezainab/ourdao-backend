@@ -4,6 +4,7 @@ import { applyEvent } from './handlers.js'
 import { namedFields, type DecodedEvent } from '../stellar/events.js'
 import { DERIVED_TABLES, resetDaoTotals } from './derived-tables.js'
 import { reindexRunsCounter, reindexDurationHistogram } from '../api/metrics.js'
+import { logger } from '../lib/logger.js'
 
 interface EventLogRow {
   id: string
@@ -44,7 +45,13 @@ export async function reindexFromEventLog(): Promise<{ events: number }> {
          FROM events ORDER BY ledger ASC, id ASC`
     )
 
-    for (const row of rows) {
+    // Issue #531: report progress as structured JSON, one line per 10% (and
+    // the final event). `msg` keeps the human-readable text an operator
+    // watching a terminal saw before; the fields make it queryable.
+    const total = rows.length
+    const progressEvery = Math.max(1, Math.ceil(total / 10))
+
+    for (const [index, row] of rows.entries()) {
       const data = Array.isArray(row.data) ? (row.data as unknown[]) : [row.data]
       const ev: DecodedEvent = {
         id: row.id,
@@ -59,6 +66,19 @@ export async function reindexFromEventLog(): Promise<{ events: number }> {
         fields: namedFields(row.symbol, data),
       }
       await applyEvent(client, ev)
+
+      const processed = index + 1
+      if (processed % progressEvery === 0 || processed === total) {
+        const elapsedSec = (Date.now() - startTime) / 1000
+        const ratePerSec = elapsedSec > 0 ? processed / elapsedSec : 0
+        const etaSec = ratePerSec > 0 ? Math.ceil((total - processed) / ratePerSec) : 0
+        const pct = total > 0 ? (processed / total) * 100 : 100
+        logger.info(
+          `[reindex] progress: ${processed}/${total} event(s) (${pct.toFixed(2)}%) — ` +
+            `${ratePerSec.toFixed(1)} events/s, eta ${etaSec}s`,
+          { processed, total, pct, ratePerSec, etaSec }
+        )
+      }
     }
 
     await client.query('COMMIT')
@@ -81,11 +101,12 @@ export async function reindexFromEventLog(): Promise<{ events: number }> {
 if (import.meta.url === `file://${process.argv[1]}`) {
   reindexFromEventLog()
     .then(({ events }) => {
-      console.log(`[reindex] rebuilt derived tables from ${events} event(s)`)
+      logger.info(`[reindex] rebuilt derived tables from ${events} event(s)`, { events })
       return pool.end()
     })
-    .catch((err) => {
-      console.error('[reindex] failed:', err)
+    .catch((err: unknown) => {
+      const message = err instanceof Error ? err.message : String(err)
+      logger.error(`[reindex] failed: ${message}`, { error: message })
       process.exit(1)
     })
 }

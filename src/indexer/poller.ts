@@ -6,6 +6,7 @@ import { server, getLatestLedger, getLatestLedgerInfo } from '../stellar/rpc.js'
 import { decodeEvent, type DecodedEvent } from '../stellar/events.js'
 import { applyEvent } from './handlers.js'
 import { DERIVED_TABLES, resetDaoTotals } from './derived-tables.js'
+import { logger } from '../lib/logger.js'
 
 interface CursorRow {
   paging_token: string | null
@@ -106,19 +107,45 @@ async function loadCursor(contractId: string): Promise<CursorRow | null> {
   return row
 }
 
-async function saveCursor(
+/** Persist the poll cursor after a page has already been folded.
+ *
+ *  This can fail *after* the fold has committed (a dropped connection, a
+ *  lock timeout, the table temporarily unavailable). That is the confusing
+ *  failure mode this log line exists for: the indexer is folding correctly,
+ *  but it can't record where it got to, so the next poll refetches the same
+ *  page and `/ready` may report the cursor as stale. It is distinct from
+ *  `[indexer] poll error` (the RPC/getEvents call itself failed, so nothing
+ *  was folded) and from `indexer_stale` (the cursor is merely idle — the
+ *  indexer may be perfectly healthy). Retrying is safe: raw events are
+ *  idempotent on their unique id, so a replayed page does not double-fold.
+ *
+ *  Exported so tests can exercise the failure path directly. */
+export async function saveCursor(
   contractId: string,
   pagingToken: string | null,
   lastLedger: number,
   observedTipLedger: number,
   lastLedgerHash: string | null
 ): Promise<void> {
-  await pool.query(
-    `INSERT INTO indexer_cursor (id, paging_token, last_ledger, last_ledger_hash, observed_tip_ledger, contract_id, updated_at)
-     VALUES (1, $1, $2, $3, $4, $5, now())
-     ON CONFLICT (id) DO UPDATE SET paging_token = $1, last_ledger = $2, last_ledger_hash = $3, observed_tip_ledger = $4, contract_id = $5, updated_at = now()`,
-    [pagingToken, lastLedger, lastLedgerHash, observedTipLedger, contractId]
-  )
+  try {
+    await pool.query(
+      `INSERT INTO indexer_cursor (id, paging_token, last_ledger, last_ledger_hash, observed_tip_ledger, contract_id, updated_at)
+       VALUES (1, $1, $2, $3, $4, $5, now())
+       ON CONFLICT (id) DO UPDATE SET paging_token = $1, last_ledger = $2, last_ledger_hash = $3, observed_tip_ledger = $4, contract_id = $5, updated_at = now()`,
+      [pagingToken, lastLedger, lastLedgerHash, observedTipLedger, contractId]
+    )
+  } catch (err) {
+    const message = err instanceof Error ? err.message : String(err)
+    logger.error(`[indexer] Cursor write failed: ${message}`, {
+      event: 'cursor_write_failed',
+      contractId,
+      pagingToken,
+      lastLedger,
+      observedTipLedger,
+      error: message,
+    })
+    throw err
+  }
 }
 
 /** Touch updated_at without changing data — keeps freshness signal alive on idle contracts. */

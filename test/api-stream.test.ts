@@ -1,7 +1,6 @@
-import { describe, expect, it, beforeEach, afterEach, vi } from 'vitest'
+import { describe, expect, it, beforeEach, afterEach } from 'vitest'
 import type { FastifyInstance } from 'fastify'
 import { buildServer } from '../src/api/server.js'
-import { pool, query } from '../src/db/index.js'
 import { closeDb, resetDb } from './db.js'
 import { STREAM_CHANNELS } from '../src/api/stream.js'
 
@@ -21,7 +20,7 @@ describe('API: /api/stream', () => {
 
   it('GET /api/stream returns 200 with SSE headers', async () => {
     // Start the stream in a promise (it will block)
-    const streamPromise = app.inject({ method: 'GET', url: '/api/stream' }).then((res) => {
+    app.inject({ method: 'GET', url: '/api/stream' }).then((res) => {
       expect(res.statusCode).toBe(200)
       expect(res.headers['content-type']).toContain('text/event-stream')
       expect(res.headers['cache-control']).toBe('no-cache')
