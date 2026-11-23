@@ -4,7 +4,12 @@
 //  - GET /metrics returns 200 with Prometheus-exposition-format body and expected Content-Type header
 //  - ourdao_sse_connections, ourdao_sse_messages_total, ourdao_sse_connections_total appear by name in scraped text
 //  - Opening/closing test SSE stream connection changes ourdao_sse_connections_total in next scrape
-import { afterAll, beforeEach, describe, expect, it } from 'vitest'
+//
+// Issue #353 tests (appended below):
+//  - allowList matches /health, /ready, /version on path only (query strings are stripped)
+//  - /metrics is NOT in the allowList (it is now rate-limited)
+//  - METRICS_TOKEN protection: 401 on missing/wrong token; 200 on correct token
+import { afterAll, afterEach, beforeEach, describe, expect, it } from 'vitest'
 import type { FastifyInstance } from 'fastify'
 import { buildServer } from '../src/api/server.js'
 import { resetConnectedStreamsForTests } from '../src/api/stream.js'
@@ -149,5 +154,105 @@ describe('GET /metrics Prometheus endpoint (issue #483)', () => {
     expect(body).toMatch(/^ourdao_sse_connections\s+\d+/m)
     expect(body).toMatch(/^ourdao_sse_messages_total\b/m)
     expect(body).toMatch(/^ourdao_sse_connections_total\s+\d+/m)
+  })
+})
+
+// Issue #353: allowList path-only matching and /metrics token protection.
+//
+// The allowList used exact string equality against req.url, which includes query
+// strings. /health?foo=1 would not be exempt, while /metrics?foo=1 would be
+// rate-limited even though /metrics was in the allowList — the opposite of what
+// was intended. The fix strips the query string before comparing.
+//
+// /metrics is removed from the allowList entirely; it now counts against the shared
+// per-IP limit and optionally requires a bearer token (METRICS_TOKEN).
+describe('/metrics — METRICS_TOKEN opt-in protection (issue #353)', () => {
+  let app: FastifyInstance
+  const originalToken = process.env.METRICS_TOKEN
+
+  afterEach(async () => {
+    if (app) await app.close()
+    if (originalToken === undefined) {
+      delete process.env.METRICS_TOKEN
+    } else {
+      process.env.METRICS_TOKEN = originalToken
+    }
+  })
+
+  it('returns 200 without a token when METRICS_TOKEN is unset (open behaviour preserved)', async () => {
+    delete process.env.METRICS_TOKEN
+    // Re-import config so the new env value is picked up
+    const { config } = await import('../src/config.js')
+    Object.assign(config.http, { metricsToken: '' })
+    app = await buildServer()
+    await app.ready()
+    const res = await app.inject({ method: 'GET', url: '/metrics' })
+    expect(res.statusCode).toBe(200)
+  })
+
+  it('returns 401 when METRICS_TOKEN is set and no Authorization header is sent', async () => {
+    const { config } = await import('../src/config.js')
+    Object.assign(config.http, { metricsToken: 'secret-scrape-token' })
+    app = await buildServer()
+    await app.ready()
+    const res = await app.inject({ method: 'GET', url: '/metrics' })
+    expect(res.statusCode).toBe(401)
+  })
+
+  it('returns 401 when METRICS_TOKEN is set and the wrong token is supplied', async () => {
+    const { config } = await import('../src/config.js')
+    Object.assign(config.http, { metricsToken: 'secret-scrape-token' })
+    app = await buildServer()
+    await app.ready()
+    const res = await app.inject({
+      method: 'GET',
+      url: '/metrics',
+      headers: { authorization: 'Bearer wrong-token' },
+    })
+    expect(res.statusCode).toBe(401)
+  })
+
+  it('returns 200 when METRICS_TOKEN is set and the correct token is supplied', async () => {
+    const { config } = await import('../src/config.js')
+    Object.assign(config.http, { metricsToken: 'secret-scrape-token' })
+    app = await buildServer()
+    await app.ready()
+    const res = await app.inject({
+      method: 'GET',
+      url: '/metrics',
+      headers: { authorization: 'Bearer secret-scrape-token' },
+    })
+    expect(res.statusCode).toBe(200)
+  })
+})
+
+describe('rate-limit allowList — query-string stripping (issue #353)', () => {
+  let app: FastifyInstance
+
+  beforeEach(async () => {
+    await resetDb()
+    app = await buildServer()
+    await app.ready()
+  })
+
+  afterEach(async () => {
+    if (app) await app.close()
+  })
+
+  afterAll(closeDb)
+
+  it('/health?probe=1 is still exempt from rate limiting', async () => {
+    for (let i = 0; i < 150; i++) {
+      const res = await app.inject({ method: 'GET', url: '/health?probe=1' })
+      expect(res.statusCode).toBe(200)
+    }
+  })
+
+  it('/ready?check=liveness is still exempt from rate limiting', async () => {
+    for (let i = 0; i < 150; i++) {
+      const res = await app.inject({ method: 'GET', url: '/ready?check=liveness' })
+      // May return 200 or 503 depending on DB state, but never 429
+      expect(res.statusCode).not.toBe(429)
+    }
   })
 })

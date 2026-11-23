@@ -9,6 +9,7 @@ import {
   verifySignature,
   AuthFailureTracker,
   MemoryNonceStore,
+  NONCE_TIMESTAMP_HEX_LEN,
   authStats,
   getAuthStats,
   resetAuthStats,
@@ -382,6 +383,101 @@ describe('authenticateRequest — configurable nonce TTL (#372)', () => {
       status: 401,
       error: 'Invalid or expired nonce',
     })
+    await store.shutdown()
+  })
+})
+
+// Issue #352: malformed nonces must be rejected before the store is queried.
+// Number.parseInt(hex, 16) returns NaN for non-hex input; NaN > maxAge || NaN < 0
+// evaluates to false, so the broken pre-check let arbitrary strings reach
+// nonceStore.consume and signature verification. The fix validates with a regex
+// first and uses Number.isFinite() as a secondary guard.
+describe('authenticateRequest — malformed nonce pre-check (#352)', () => {
+  const keypairLocal = Keypair.random()
+  const address = keypairLocal.publicKey()
+
+  function sign(nonce: string): string {
+    return keypairLocal.sign(Buffer.from(`${nonce}:${address}`, 'utf8')).toString('base64')
+  }
+
+  function headers(nonce: string): Record<string, unknown> {
+    return { authorization: `StellarSignature ${address}:${sign(nonce)}:${nonce}` }
+  }
+
+  it('rejects a non-hex nonce without calling consume', async () => {
+    let consumeCalled = false
+    const store: NonceStore = {
+      issue: async () => 'x',
+      consume: async () => { consumeCalled = true; return true },
+      shutdown: async () => {},
+    }
+    const nonce = 'z'.repeat(64)
+    const result = await authenticateRequest(headers(nonce), store)
+    expect(consumeCalled).toBe(false)
+    expect(result).toMatchObject({ authenticated: false, status: 401, error: 'Invalid or expired nonce' })
+  })
+
+  it('rejects a nonce that is the right length but contains uppercase hex', async () => {
+    let consumeCalled = false
+    const store: NonceStore = {
+      issue: async () => 'x',
+      consume: async () => { consumeCalled = true; return true },
+      shutdown: async () => {},
+    }
+    // Valid hex digits but uppercase — the regex requires lowercase per NONCE_FORMAT_RE
+    const nonce = 'A'.repeat(64)
+    const result = await authenticateRequest(headers(nonce), store)
+    expect(consumeCalled).toBe(false)
+    expect(result).toMatchObject({ authenticated: false, status: 401 })
+  })
+
+  it('rejects a nonce that is too short without calling consume', async () => {
+    let consumeCalled = false
+    const store: NonceStore = {
+      issue: async () => 'x',
+      consume: async () => { consumeCalled = true; return true },
+      shutdown: async () => {},
+    }
+    const nonce = 'ab'.repeat(16) // 32 chars, expected 64
+    const result = await authenticateRequest(headers(nonce), store)
+    expect(consumeCalled).toBe(false)
+    expect(result).toMatchObject({ authenticated: false, status: 401 })
+  })
+
+  it('rejects a nonce that is too long without calling consume', async () => {
+    let consumeCalled = false
+    const store: NonceStore = {
+      issue: async () => 'x',
+      consume: async () => { consumeCalled = true; return true },
+      shutdown: async () => {},
+    }
+    const nonce = 'ab'.repeat(40) // 80 chars, expected 64
+    const result = await authenticateRequest(headers(nonce), store)
+    expect(consumeCalled).toBe(false)
+    expect(result).toMatchObject({ authenticated: false, status: 401 })
+  })
+
+  it('increments the invalidNonce counter for a malformed nonce', async () => {
+    const store: NonceStore = {
+      issue: async () => 'x',
+      consume: async () => true,
+      shutdown: async () => {},
+    }
+    const before = authStats.verificationsFailed.invalidNonce
+    await authenticateRequest(headers('zzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzz'), store)
+    expect(authStats.verificationsFailed.invalidNonce).toBe(before + 1)
+  })
+
+  it('accepts a correctly formatted nonce whose timestamp is within the TTL', async () => {
+    // A real nonce from the store will be properly formatted
+    const store = new MemoryNonceStore()
+    const nonce = await store.issue(address)
+    expect(nonce).toHaveLength(64)
+    // Verify NONCE_TIMESTAMP_HEX_LEN is what we sliced
+    const prefix = nonce.slice(0, NONCE_TIMESTAMP_HEX_LEN)
+    expect(/^[0-9a-f]+$/.test(prefix)).toBe(true)
+    const result = await authenticateRequest(headers(nonce), store)
+    expect(result).toMatchObject({ authenticated: true, address })
     await store.shutdown()
   })
 })

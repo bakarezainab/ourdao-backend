@@ -163,6 +163,11 @@ export function resolveConfig(env: NodeJS.ProcessEnv) {
     // Pino log level for the Fastify server (fatal, error, warn, info, debug, trace, silent).
     // 'silent' suppresses all request logging, which the test harness uses.
     logLevel: logLevel(env, 'LOG_LEVEL', 'info'),
+    // Issue #353: optional bearer token to restrict GET /metrics access.
+    // When set, requests without "Authorization: Bearer <token>" are rejected
+    // with 401. Leave unset for internal/trusted deployments (the previous
+    // open behaviour is preserved).
+    metricsToken: str(env, 'METRICS_TOKEN'),
     // Issue #167: /ready races its Postgres check against this timeout so a
     // hung database (mid-failover, an exhausted pool) reports `503` within a
     // bounded time instead of leaving the orchestrator to time out the HTTP
