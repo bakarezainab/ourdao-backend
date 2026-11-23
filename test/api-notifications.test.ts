@@ -30,6 +30,73 @@ describe('API: notification mutations', () => {
     expect(res.statusCode).toBe(400)
   })
 
+  it('GET /api/notifications supports before-id cursor pagination', async () => {
+    await query(
+      `INSERT INTO notifications (id, address, type, title, message) VALUES
+       (10, $1, 'info', 't', 'm'), (11, $1, 'info', 't', 'm'), (12, $1, 'info', 't', 'm')`,
+      [address]
+    )
+    const res = await app.inject({ method: 'GET', url: `/api/notifications?address=${address}&before=12&limit=1` })
+    const body = res.json()
+    expect(body).toHaveLength(1)
+    expect(body[0].id).toBe(11)
+  })
+
+  it('GET /api/notifications rejects an invalid before cursor', async () => {
+    const res = await app.inject({ method: 'GET', url: `/api/notifications?address=${address}&before=not-a-number` })
+    expect(res.statusCode).toBe(400)
+  })
+
+  it('GET /api/notifications filters by unread state', async () => {
+    await query(
+      `INSERT INTO notifications (id, address, type, title, message, read) VALUES
+       (20, $1, 'info', 'unread 1', 'm', false),
+       (21, $1, 'info', 'read 1', 'm', true),
+       (22, $1, 'info', 'unread 2', 'm', false)`,
+      [address]
+    )
+    const resUnread = await app.inject({ method: 'GET', url: `/api/notifications?address=${address}&unread=true` })
+    expect(resUnread.statusCode).toBe(200)
+    const unreadBody = resUnread.json()
+    expect(unreadBody).toHaveLength(2)
+    expect(unreadBody.map((n: { id: number }) => n.id)).toEqual([22, 20])
+
+    const resRead = await app.inject({ method: 'GET', url: `/api/notifications?address=${address}&unread=false` })
+    expect(resRead.statusCode).toBe(200)
+    const readBody = resRead.json()
+    expect(readBody).toHaveLength(1)
+    expect(readBody[0].id).toBe(21)
+  })
+
+  it('GET /api/notifications rejects an invalid unread parameter', async () => {
+    const res = await app.inject({ method: 'GET', url: `/api/notifications?address=${address}&unread=maybe` })
+    expect(res.statusCode).toBe(400)
+  })
+
+  it('PATCH /api/notifications/:id/read supports muxed accounts verifying against canonical base address', async () => {
+    const muxedKeypair = Keypair.random()
+    const baseAddr = muxedKeypair.publicKey()
+    const muxedAddr = new (await import('@stellar/stellar-sdk')).MuxedAccount(new (await import('@stellar/stellar-sdk')).Account(baseAddr, '0'), '123').accountId()
+
+    const [row] = await query<{ id: number }>(
+      `INSERT INTO notifications (address, type, title, message) VALUES ($1, 'info', 't', 'm') RETURNING id`,
+      [baseAddr]
+    )
+
+    const challenge = await app.inject({ method: 'GET', url: `/api/auth/challenge?address=${muxedAddr}` })
+    const nonce = challenge.json().nonce as string
+    const signature = muxedKeypair.sign(Buffer.from(`${nonce}:${muxedAddr}`)).toString('base64')
+    const authHdr = `StellarSignature ${muxedAddr}:${signature}:${nonce}`
+
+    const res = await app.inject({
+      method: 'PATCH',
+      url: `/api/notifications/${row!.id}/read`,
+      headers: { authorization: authHdr },
+    })
+    expect(res.statusCode).toBe(200)
+    expect(res.json().read).toBe(true)
+  })
+
   it('PATCH /api/notifications/:id/read marks that row read and 404s for a missing id', async () => {
     const [row] = await query<{ id: number }>(
       `INSERT INTO notifications (address, type, title, message) VALUES ($1, 'info', 't', 'm') RETURNING id`,
@@ -87,5 +154,29 @@ describe('API: notification mutations', () => {
   it('PATCH /api/notifications/read-all requires an address', async () => {
     const res = await app.inject({ method: 'PATCH', url: '/api/notifications/read-all' })
     expect(res.statusCode).toBe(400)
+  })
+
+  // Issue #134: acting on another member's notifications must fail the same
+  // way — 403, not a mix of 401/403 — regardless of which route rejects it.
+  it('rejects acting on another address\'s notifications with 403 on both routes', async () => {
+    const other = Keypair.random().publicKey()
+
+    const [row] = await query<{ id: number }>(
+      `INSERT INTO notifications (address, type, title, message) VALUES ($1, 'info', 't', 'm') RETURNING id`,
+      [other]
+    )
+    const byId = await app.inject({
+      method: 'PATCH',
+      url: `/api/notifications/${row!.id}/read`,
+      headers: { authorization: await authHeader(app) },
+    })
+    expect(byId.statusCode).toBe(403)
+
+    const readAll = await app.inject({
+      method: 'PATCH',
+      url: `/api/notifications/read-all?address=${other}`,
+      headers: { authorization: await authHeader(app) },
+    })
+    expect(readAll.statusCode).toBe(403)
   })
 })

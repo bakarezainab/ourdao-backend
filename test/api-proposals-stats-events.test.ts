@@ -1,7 +1,15 @@
 import { afterAll, beforeEach, describe, expect, it, vi } from 'vitest'
+import { Keypair } from '@stellar/stellar-sdk'
 import type { FastifyInstance } from 'fastify'
 import { buildServer } from '../src/api/server.js'
+import { config } from '../src/config.js'
 import { pool, query } from '../src/db/index.js'
+import {
+  notifyStreamClientsAfterCommit,
+  PG_NOTIFY_MAX_PAYLOAD_BYTES,
+  resetNotificationFailureCountForTests,
+  STREAM_CHANNELS,
+} from '../src/api/stream.js'
 import { closeDb, resetDb } from './db.js'
 
 describe('API: proposals, stats, events, admin/log', () => {
@@ -15,11 +23,72 @@ describe('API: proposals, stats, events, admin/log', () => {
   afterAll(closeDb)
 
   it('GET /api/proposals/loan returns newest first', async () => {
+    const kp = Keypair.random()
+    const addr = kp.publicKey()
     await query(
-      `INSERT INTO loan_proposals (id, borrower, amount) VALUES (1, 'GA', 100), (2, 'GA', 200)`
+      `INSERT INTO loan_proposals (id, borrower, amount) VALUES (1, $1, 100), (2, $1, 200)`,
+      [addr],
     )
     const res = await app.inject({ method: 'GET', url: '/api/proposals/loan' })
-    expect(res.json().map((p: { id: number }) => p.id)).toEqual([2, 1])
+    const body = res.json()
+    expect(body.map((p: { id: number }) => p.id)).toEqual([2, 1])
+    expect(body[0].tallies_weighted).toBe(false)
+  })
+
+  it('GET /api/proposals/loan filters by status and borrower (issue #400)', async () => {
+    const kp1 = Keypair.random()
+    const addr1 = kp1.publicKey()
+    const kp2 = Keypair.random()
+    const addr2 = kp2.publicKey()
+
+    await query(
+      `INSERT INTO loan_proposals (id, borrower, amount, status) VALUES
+       (1, $1, 100, 'pending'),
+       (2, $1, 200, 'approved'),
+       (3, $2, 300, 'pending'),
+       (4, $2, 400, 'rejected')`,
+      [addr1, addr2],
+    )
+
+    // Filter by status
+    const pendingRes = await app.inject({ method: 'GET', url: '/api/proposals/loan?status=pending' })
+    expect(pendingRes.statusCode).toBe(200)
+    expect(pendingRes.json().map((p: { id: number }) => p.id)).toEqual([3, 1])
+
+    // Filter by borrower
+    const borrowerRes = await app.inject({ method: 'GET', url: `/api/proposals/loan?borrower=${addr1}` })
+    expect(borrowerRes.statusCode).toBe(200)
+    expect(borrowerRes.json().map((p: { id: number }) => p.id)).toEqual([2, 1])
+
+    // Filter by both borrower and status
+    const combinedRes = await app.inject({
+      method: 'GET',
+      url: `/api/proposals/loan?borrower=${addr1}&status=approved`,
+    })
+    expect(combinedRes.statusCode).toBe(200)
+    expect(combinedRes.json().map((p: { id: number }) => p.id)).toEqual([2])
+
+    // Reject invalid borrower address
+    const invalidRes = await app.inject({ method: 'GET', url: '/api/proposals/loan?borrower=not-an-address' })
+    expect(invalidRes.statusCode).toBe(400)
+  })
+
+  it('GET /api/proposals/loan/:id returns single proposal or 404 (issue #398)', async () => {
+    const kp = Keypair.random()
+    const addr = kp.publicKey()
+    await query(`INSERT INTO loan_proposals (id, borrower, amount, status) VALUES (42, $1, 500, 'pending')`, [addr])
+
+    const res = await app.inject({ method: 'GET', url: '/api/proposals/loan/42' })
+    expect(res.statusCode).toBe(200)
+    expect(res.json().id).toBe(42)
+    expect(res.json().borrower).toBe(addr)
+    expect(res.json().tallies_weighted).toBe(false)
+
+    const notFound = await app.inject({ method: 'GET', url: '/api/proposals/loan/999' })
+    expect(notFound.statusCode).toBe(404)
+
+    const invalid = await app.inject({ method: 'GET', url: '/api/proposals/loan/not-a-number' })
+    expect(invalid.statusCode).toBe(400)
   })
 
   it('GET /api/proposals/treasury returns newest first', async () => {
@@ -27,7 +96,41 @@ describe('API: proposals, stats, events, admin/log', () => {
       `INSERT INTO treasury_proposals (id, amount, destination) VALUES (1, 100, 'GD'), (2, 200, 'GD')`
     )
     const res = await app.inject({ method: 'GET', url: '/api/proposals/treasury' })
-    expect(res.json().map((p: { id: number }) => p.id)).toEqual([2, 1])
+    const body = res.json()
+    expect(body.map((p: { id: number }) => p.id)).toEqual([2, 1])
+    expect(body[0].tallies_weighted).toBe(false)
+  })
+
+  it('GET /api/proposals/treasury filters by status (issue #400)', async () => {
+    await query(
+      `INSERT INTO treasury_proposals (id, amount, destination, status) VALUES
+       (1, 100, 'GD1', 'pending'),
+       (2, 200, 'GD2', 'executed'),
+       (3, 300, 'GD3', 'pending')`,
+    )
+    const res = await app.inject({ method: 'GET', url: '/api/proposals/treasury?status=pending' })
+    expect(res.statusCode).toBe(200)
+    expect(res.json().map((p: { id: number }) => p.id)).toEqual([3, 1])
+
+    const executedRes = await app.inject({ method: 'GET', url: '/api/proposals/treasury?status=executed' })
+    expect(executedRes.statusCode).toBe(200)
+    expect(executedRes.json().map((p: { id: number }) => p.id)).toEqual([2])
+  })
+
+  it('GET /api/proposals/treasury/:id returns single proposal or 404 (issue #398)', async () => {
+    await query(`INSERT INTO treasury_proposals (id, amount, destination, status) VALUES (55, 1000, 'GD55', 'pending')`)
+
+    const res = await app.inject({ method: 'GET', url: '/api/proposals/treasury/55' })
+    expect(res.statusCode).toBe(200)
+    expect(res.json().id).toBe(55)
+    expect(res.json().destination).toBe('GD55')
+    expect(res.json().tallies_weighted).toBe(false)
+
+    const notFound = await app.inject({ method: 'GET', url: '/api/proposals/treasury/999' })
+    expect(notFound.statusCode).toBe(404)
+
+    const invalid = await app.inject({ method: 'GET', url: '/api/proposals/treasury/abc' })
+    expect(invalid.statusCode).toBe(400)
   })
 
   it('GET /api/stats aggregates across all domain tables', async () => {
@@ -35,8 +138,8 @@ describe('API: proposals, stats, events, admin/log', () => {
     // should be excluded from totalStaked (issue #13). GPHANTOM: a row with
     // no join event (e.g. from name_reg) that must count for nothing (#14).
     await query(
-      `INSERT INTO members (address, joined_ledger, exited, stake) VALUES
-       ('GA', 10, false, 100), ('GB', 20, true, 50), ('GPHANTOM', NULL, false, 0)`
+      `INSERT INTO members (address, joined_ledger, exited, stake, contribution) VALUES
+       ('GA', 10, false, 100, 400), ('GB', 20, true, 50, 200), ('GPHANTOM', NULL, false, 0, 0)`
     )
     await query(`INSERT INTO loan_proposals (id, borrower, amount) VALUES (1, 'GA', 100)`)
     await query(
@@ -45,15 +148,15 @@ describe('API: proposals, stats, events, admin/log', () => {
     )
     await query(`INSERT INTO treasury_proposals (id, amount, destination) VALUES (1, 500, 'GD')`)
     await query(
-      `INSERT INTO indexer_cursor (id, last_ledger) VALUES (1, 999)
-       ON CONFLICT (id) DO UPDATE SET last_ledger = 999`
+      `INSERT INTO indexer_cursor (contract_id, last_ledger) VALUES ('CTEST', 999)
+       ON CONFLICT (contract_id) DO UPDATE SET last_ledger = 999`
     )
 
     await query(
       `UPDATE dao_totals SET interest_collected = 4200, principal_lent = 9000,
               principal_repaid = 3000, value_defaulted = 88 WHERE id = 1`
     )
-    await query(`UPDATE indexer_cursor SET observed_tip_ledger = 1200 WHERE id = 1`)
+    await query(`UPDATE indexer_cursor SET observed_tip_ledger = 1200 WHERE contract_id = 'CTEST'`)
     await query(
       `INSERT INTO failed_events (event_id, symbol, ledger, error) VALUES ('999-0', 'loan_dflt', 999, 'boom')`
     )
@@ -73,10 +176,16 @@ describe('API: proposals, stats, events, admin/log', () => {
     expect(body.totalTreasuryProposals).toBe(1)
     // Only GA's stake — GB exited, so their stale 50 is excluded.
     expect(body.totalStaked).toBe('100')
+    // Issue #281: staking ratio over active members only — GA's 100 staked
+    // out of GA's 400 contribution (GB and GPHANTOM excluded, same as totalStaked).
+    expect(body.totalContribution).toBe('400')
+    expect(body.stakingRatio).toBeCloseTo(0.25)
     expect(body.lastIndexedLedger).toBe(999)
     // Issue #45: the folded high-water mark and the RPC-observed tip are
     // reported separately rather than conflated into one column.
     expect(body.observedTipLedger).toBe(1200)
+    // Issue #139: derived from the configured ledger close time, not a bare literal.
+    expect(body.estimatedLagSeconds).toBe((1200 - 999) * config.stellar.ledgerCloseTimeSeconds)
     // Issue #43: a dashboard-visible count of quarantined events.
     expect(body.quarantinedEvents).toBe(1)
     // Lifetime money figures (issue #24), decimal strings.
@@ -84,10 +193,13 @@ describe('API: proposals, stats, events, admin/log', () => {
     expect(body.principalLent).toBe('9000')
     expect(body.principalRepaid).toBe('3000')
     expect(body.valueDefaulted).toBe('88')
+    // Issue #156: live SSE connection count is part of the stats payload.
+    expect(typeof body.connectedStreams).toBe('number')
+    expect(body.connectedStreams).toBeGreaterThanOrEqual(0)
   })
 
   it('GET /api/stats is cached: a burst of calls issues one set of queries (issue #18)', async () => {
-    await query(`INSERT INTO indexer_cursor (id, last_ledger) VALUES (1, 5) ON CONFLICT (id) DO UPDATE SET last_ledger = 5`)
+    await query(`INSERT INTO indexer_cursor (contract_id, last_ledger) VALUES ('CTEST', 5) ON CONFLICT (contract_id) DO UPDATE SET last_ledger = 5`)
     const spy = vi.spyOn(pool, 'query')
     try {
       const first = await app.inject({ method: 'GET', url: '/api/stats' })
@@ -103,6 +215,88 @@ describe('API: proposals, stats, events, admin/log', () => {
       expect(third.json()).toEqual(first.json())
     } finally {
       spy.mockRestore()
+    }
+  })
+
+  it('cached /api/stats responses reflect live notificationFailures (issue #382)', async () => {
+    resetNotificationFailureCountForTests()
+    const first = await app.inject({ method: 'GET', url: '/api/stats' })
+    expect(first.json().notificationFailures).toBe(0)
+
+    // An oversized payload is refused and counted without touching the DB.
+    await notifyStreamClientsAfterCommit(STREAM_CHANNELS.members, { blob: 'x'.repeat(PG_NOTIFY_MAX_PAYLOAD_BYTES + 1) })
+
+    const spy = vi.spyOn(pool, 'query')
+    try {
+      const cached = await app.inject({ method: 'GET', url: '/api/stats' })
+      // Served from cache: no recompute queries were issued.
+      expect(spy).not.toHaveBeenCalled()
+      expect(cached.json().notificationFailures).toBe(1)
+      expect({ ...cached.json(), notificationFailures: 0 }).toEqual(first.json())
+    } finally {
+      spy.mockRestore()
+      resetNotificationFailureCountForTests()
+    }
+  })
+
+  it('serves the last stats value when an expired-cache recompute fails', async () => {
+    const initial = await app.inject({ method: 'GET', url: '/api/stats' })
+    expect(initial.statusCode).toBe(200)
+
+    const realNow = Date.now
+    const clock = vi.spyOn(Date, 'now').mockReturnValue(realNow() + config.http.statsCacheMs + 1)
+    const queryFailure = vi.spyOn(pool, 'query').mockRejectedValueOnce(new Error('database unavailable'))
+    try {
+      const stale = await app.inject({ method: 'GET', url: '/api/stats' })
+      expect(stale.statusCode).toBe(200)
+      expect(stale.headers['x-data-stale']).toBe('true')
+      expect(stale.json()).toEqual(initial.json())
+    } finally {
+      clock.mockRestore()
+      queryFailure.mockRestore()
+    }
+  })
+
+  it('sheds a blocked stats recompute while an ordinary read still succeeds', async () => {
+    // This is deliberately a real Postgres test. An ACCESS EXCLUSIVE lock
+    // makes the aggregate wait on `members`; while it occupies the one stats
+    // slot, another stats request must receive 503, yet `/loans` (a cheap
+    // query on a different table) still obtains a pool connection and works.
+    const locker = await pool.connect()
+    let firstStats: Promise<Awaited<ReturnType<typeof app.inject>>> | undefined
+    try {
+      await locker.query('BEGIN')
+      await locker.query('LOCK TABLE members IN ACCESS EXCLUSIVE MODE')
+      firstStats = app.inject({ method: 'GET', url: '/api/stats' })
+
+      const deadline = Date.now() + 2_000
+      let statsQueryIsBlocked = false
+      while (Date.now() < deadline) {
+        const waiting = await pool.query<{ wait_event_type: string | null }>(
+          `SELECT wait_event_type
+             FROM pg_stat_activity
+            WHERE datname = current_database()
+              AND query LIKE '%AS total_members%'
+              AND wait_event_type = 'Lock'`
+        )
+        if (waiting.rows.length > 0) {
+          statsQueryIsBlocked = true
+          break
+        }
+        await new Promise((resolve) => setTimeout(resolve, 10))
+      }
+      expect(statsQueryIsBlocked).toBe(true)
+
+      const shed = await app.inject({ method: 'GET', url: '/api/stats' })
+      expect(shed.statusCode).toBe(503)
+      expect(shed.headers['retry-after']).toBe(String(config.http.statsRetryAfterSeconds))
+
+      const cheapRead = await app.inject({ method: 'GET', url: '/api/loans' })
+      expect(cheapRead.statusCode).toBe(200)
+    } finally {
+      await locker.query('ROLLBACK')
+      locker.release()
+      await firstStats
     }
   })
 
@@ -135,6 +329,52 @@ describe('API: proposals, stats, events, admin/log', () => {
     expect(body.every((e: { contract_id: string }) => e.contract_id === 'CNEW')).toBe(true)
   })
 
+  // Issue #278
+  it('GET /api/events?from_ledger=&to_ledger= filters by ledger range, additively with other filters', async () => {
+    await query(
+      `INSERT INTO events (id, ledger, closed_at, contract_id, symbol, topics, data) VALUES
+       ('1-0', 10, now(), 'C1', 'joined', '[]', '[]'),
+       ('2-0', 20, now(), 'C1', 'staked', '[]', '[]'),
+       ('3-0', 30, now(), 'C1', 'joined', '[]', '[]'),
+       ('4-0', 40, now(), 'C1', 'joined', '[]', '[]')`
+    )
+
+    const ranged = await app.inject({ method: 'GET', url: '/api/events?from_ledger=15&to_ledger=35' })
+    expect(ranged.statusCode).toBe(200)
+    const rangedBody = ranged.json().events
+    expect(rangedBody).toHaveLength(2)
+    expect(rangedBody.every((e: { ledger: number }) => e.ledger >= 15 && e.ledger <= 35)).toBe(true)
+
+    // Additive with an existing filter (symbol=joined excludes the ledger-20 `staked` row anyway).
+    const combined = await app.inject({ method: 'GET', url: '/api/events?symbol=joined&from_ledger=15&to_ledger=35' })
+    expect(combined.json().events).toHaveLength(1)
+    expect(combined.json().events[0].ledger).toBe(30)
+
+    // A single bound with no counterpart has no range to validate.
+    const onlyFrom = await app.inject({ method: 'GET', url: '/api/events?from_ledger=35' })
+    expect(onlyFrom.statusCode).toBe(200)
+    expect(onlyFrom.json().events).toHaveLength(1)
+    expect(onlyFrom.json().events[0].ledger).toBe(40)
+  })
+
+  it('GET /api/events rejects invalid from_ledger/to_ledger combinations with 400 (issue #278)', async () => {
+    const backwards = await app.inject({ method: 'GET', url: '/api/events?from_ledger=50&to_ledger=10' })
+    expect(backwards.statusCode).toBe(400)
+
+    const tooWide = await app.inject({ method: 'GET', url: '/api/events?from_ledger=0&to_ledger=10001' })
+    expect(tooWide.statusCode).toBe(400)
+
+    const nonInteger = await app.inject({ method: 'GET', url: '/api/events?from_ledger=abc' })
+    expect(nonInteger.statusCode).toBe(400)
+
+    const negative = await app.inject({ method: 'GET', url: '/api/events?to_ledger=-5' })
+    expect(negative.statusCode).toBe(400)
+
+    // Exactly at the 10000-ledger cap is still valid.
+    const atCap = await app.inject({ method: 'GET', url: '/api/events?from_ledger=0&to_ledger=10000' })
+    expect(atCap.statusCode).toBe(200)
+  })
+
   it('GET /api/admin/log only returns admin/governance symbols, newest first', async () => {
     await query(
       `INSERT INTO events (id, ledger, closed_at, contract_id, symbol, topics, data) VALUES
@@ -145,6 +385,9 @@ describe('API: proposals, stats, events, admin/log', () => {
     const res = await app.inject({ method: 'GET', url: '/api/admin/log' })
     const body = res.json()
     expect(body.map((e: { symbol: string }) => e.symbol)).toEqual(['threshold', 'paused'])
+
+    const paged = await app.inject({ method: 'GET', url: '/api/admin/log?before=30' })
+    expect(paged.json().map((e: { symbol: string }) => e.symbol)).toEqual(['paused'])
   })
 
   it('GET /api/interest returns the distribution history, newest first, with a before-ledger cursor (issue #24)', async () => {

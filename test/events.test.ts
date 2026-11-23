@@ -1,6 +1,8 @@
+import { readFileSync } from 'node:fs'
+import { join } from 'node:path'
 import { describe, expect, it } from 'vitest'
 import { Address, Keypair, nativeToScVal, xdr, type rpc } from '@stellar/stellar-sdk'
-import { ADMIN_EVENT_SYMBOLS, EVENT_FIELDS, decodeEvent, toJsonSafe } from '../src/stellar/events.js'
+import { ADMIN_EVENT_SYMBOLS, EVENT_FIELDS, FIXTURE_SDK_VERSION, decodeEvent, toJsonSafe } from '../src/stellar/events.js'
 
 const ADDR = Keypair.random().publicKey()
 
@@ -65,6 +67,29 @@ describe('decodeEvent', () => {
     expect(ev.fields.weight).toBeNull()
   })
 
+  it('decodes loan_wait/tre_wait (id, amount) and loan_rej/tre_rej (id, for_votes, against_votes) (issues #123-125)', () => {
+    const waitData = tuple(nativeToScVal(7, { type: 'u32' }), nativeToScVal(1_000_000_000_000n, { type: 'i128' }))
+    for (const symbol of ['loan_wait', 'tre_wait'] as const) {
+      const ev = decodeEvent(makeEvent(symbol, waitData))
+      expect(Object.keys(ev.fields)).toEqual(EVENT_FIELDS[symbol])
+      expect(ev.fields.id).toBe(7)
+      expect(typeof ev.fields.amount).toBe('string')
+    }
+
+    const rejData = tuple(
+      nativeToScVal(8, { type: 'u32' }),
+      nativeToScVal(200_000_000_000n, { type: 'i128' }),
+      nativeToScVal(500_000_000_000n, { type: 'i128' })
+    )
+    for (const symbol of ['loan_rej', 'tre_rej'] as const) {
+      const ev = decodeEvent(makeEvent(symbol, rejData))
+      expect(Object.keys(ev.fields)).toEqual(EVENT_FIELDS[symbol])
+      expect(ev.fields.id).toBe(8)
+      expect(ev.fields.for_votes).toBe('200000000000')
+      expect(ev.fields.against_votes).toBe('500000000000')
+    }
+  })
+
   it('falls back to an empty fields map for an unknown symbol, but keeps the raw data', () => {
     const data = tuple(nativeToScVal(1, { type: 'u32' }))
     const ev = decodeEvent(makeEvent('totally_unknown_symbol', data))
@@ -83,6 +108,21 @@ describe('decodeEvent', () => {
       expect(Object.prototype.hasOwnProperty.call(EVENT_FIELDS, sym)).toBe(true)
     }
   })
+
+  it('captures topic decode error and flags the event', () => {
+    const data = tuple(nativeToScVal(1, { type: 'u32' }))
+    const evRaw = makeEvent('some_symbol', data)
+    evRaw.topic = [{} as xdr.ScVal]
+    const ev = decodeEvent(evRaw)
+    expect(ev.decodeError).toBeTruthy()
+    expect(ev.symbol).toBe('')
+  })
+
+  it('captures data decode error and flags the event', () => {
+    const evRaw = makeEvent('some_symbol', {} as xdr.ScVal)
+    const ev = decodeEvent(evRaw)
+    expect(ev.decodeError).toBeTruthy()
+  })
 })
 
 describe('toJsonSafe', () => {
@@ -97,3 +137,16 @@ describe('toJsonSafe', () => {
     expect(toJsonSafe(null)).toBe(null)
   })
 })
+
+describe('Soroban RPC wire fixture version (#206)', () => {
+  it('records the SDK version the fixtures were captured against', () => {
+    expect(FIXTURE_SDK_VERSION).toBe('16.0.1')
+    const pkg = JSON.parse(readFileSync(join(process.cwd(), 'package.json'), 'utf-8')) as {
+      dependencies: Record<string, string>
+    }
+    const sdkPin = pkg.dependencies['@stellar/stellar-sdk']
+    expect(sdkPin).toBeDefined()
+    expect(sdkPin).toContain('16.0.1')
+  })
+})
+

@@ -1,5 +1,16 @@
 # Local Postgres for development. Run: docker compose up -d
+# Ports bind to 127.0.0.1 only: Redis has no password and Postgres uses default credentials.
 services:
+  redis:
+    image: redis:7-alpine
+    restart: unless-stopped
+    ports:
+      - '127.0.0.1:6379:6379'
+    healthcheck:
+      test: ['CMD', 'redis-cli', 'ping']
+      interval: 5s
+      timeout: 5s
+      retries: 5
   db:
     image: postgres:16-alpine
     restart: unless-stopped
@@ -8,7 +19,7 @@ services:
       POSTGRES_PASSWORD: ourdao
       POSTGRES_DB: ourdao
     ports:
-      - '5432:5432'
+      - '127.0.0.1:5432:5432'
     volumes:
       - ourdao_pgdata:/var/lib/postgresql/data
     healthcheck:

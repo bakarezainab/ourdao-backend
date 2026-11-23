@@ -4,14 +4,28 @@
 
 // The complete set of values each status column may hold, in one place (#73).
 // The database CHECK constraints — inline in src/db/schema.sql and added to
-// existing databases by src/db/migrations/0012_status_check_constraints.sql —
-// must accept exactly these, and test/status-constraints.test.ts fails if the
-// two drift. `'cancelled'` is a declared loan-proposal state that no handler
-// writes yet; it is kept deliberately (the loan_exp work will use it for
-// expired proposals) rather than dropped.
-export const LOAN_PROPOSAL_STATUSES = ['pending', 'approved', 'rejected', 'cancelled'] as const
+// existing databases by src/db/migrations/0012_status_check_constraints.sql
+// (and, for `approved_pending_disbursement`, 0017_approved_pending_disbursement_status.sql)
+// — must accept exactly these, and test/status-constraints.test.ts fails if
+// the two drift. `'cancelled'` is a declared loan-proposal state that no
+// handler writes yet; it is kept deliberately (the loan_exp work will use it
+// for expired proposals) rather than dropped. `'approved_pending_disbursement'`
+// is the state a proposal sits in between reaching quorum and actually being
+// disbursed once the treasury can cover it (`loan_wait`/`tre_wait`, issue #125).
+export const LOAN_PROPOSAL_STATUSES = [
+  'pending',
+  'approved',
+  'rejected',
+  'cancelled',
+  'approved_pending_disbursement',
+] as const
 export const LOAN_STATUSES = ['active', 'repaid', 'defaulted'] as const
-export const TREASURY_PROPOSAL_STATUSES = ['pending', 'executed', 'rejected'] as const
+export const TREASURY_PROPOSAL_STATUSES = [
+  'pending',
+  'executed',
+  'rejected',
+  'approved_pending_disbursement',
+] as const
 
 export type LoanProposalStatus = (typeof LOAN_PROPOSAL_STATUSES)[number]
 export type LoanStatus = (typeof LOAN_STATUSES)[number]
@@ -34,9 +48,24 @@ export interface MemberRow {
 
 export interface MemberSummary {
   member: MemberRow
-  loans: (LoanRow & { interest_charge: string; repaid_amount: string })[]
+  // Capped at LOANS_EMBED_LIMIT (issue #165) — loans_truncated is true when
+  // the member has more than that; the full history is paginated separately
+  // via GET /api/loans?borrower=<address>. The aggregate counts in
+  // `position` below are computed over ALL of the member's loans regardless
+  // of this cap, never just the embedded page.
+  // Derived fields are null for a loan with a malformed amount column (issue #195).
+  loans: (LoanRow & {
+    interest_charge: string | null
+    repaid_amount: string | null
+    repayment_progress_bps: number | null
+  })[]
+  loans_total_count: number
+  loans_truncated: boolean
   unread_notifications: number
   position: {
+    // Share of currently-active total contribution/stake (issue #164) —
+    // matches ourdao-contracts' calculate_exit_share, which is 0 for any
+    // non-active member and otherwise contribution / total_active_contributions.
     contribution_share_bps: string
     stake_share_bps: string
     repaid_loans_count: number
@@ -56,6 +85,7 @@ export interface LoanProposalRow {
   votes_for: string
   votes_against: string
   voter_count: number
+  tallies_weighted: boolean
   created_ledger: number | null
   updated_at: string
 }
@@ -83,6 +113,7 @@ export interface TreasuryProposalRow {
   votes_for: string
   votes_against: string
   voter_count: number
+  tallies_weighted: boolean
   created_ledger: number | null
   executed_ledger: number | null
   updated_at: string
@@ -111,6 +142,7 @@ export interface EventRow {
   topics: unknown
   data: unknown
   tx_hash: string | null
+  decode_error: string | null
   created_at: string
 }
 
@@ -154,9 +186,41 @@ export interface DocumentRow {
 export interface FailedEventRow {
   id: number
   event_id: string
+  contract_id: string | null
   symbol: string
   ledger: number
   error: string
+  created_at: string
+  // Issue #168: set once a reindex or targeted replay (#170) re-folded this
+  // event successfully. NULL means still outstanding.
+  resolved_at: string | null
+  // Issue #287: how resolved_at came to be set via the batch-resolve admin
+  // endpoint — 'resolved' (the underlying issue was fixed/replayed) or
+  // 'ignored' (an operator decided it doesn't need fixing). NULL for rows
+  // resolved by a reindex (#168) rather than the batch endpoint, and for
+  // still-unresolved rows.
+  resolution: 'resolved' | 'ignored' | null
+  resolution_note: string | null
+}
+
+// Issue #291: machine-readable labels for every admin action type that is
+// written to admin_audit_log. Append-only — never rename or remove a value,
+// since existing rows in the database reference these strings.
+export const ADMIN_AUDIT_ACTIONS = [
+  'resolve_quarantined_event',
+  'reset_cursor',
+  'manual_reindex',
+  'clear_reorg',
+] as const
+
+export type AdminAuditAction = (typeof ADMIN_AUDIT_ACTIONS)[number]
+
+export interface AdminAuditLogRow {
+  id: number
+  admin_address: string
+  action: AdminAuditAction | string  // string fallback for future actions not yet in the enum
+  ip_address: string | null
+  payload: Record<string, unknown>
   created_at: string
 }
 
@@ -170,6 +234,13 @@ export interface DAOStats {
   totalDefaultedValue: string
   totalTreasuryProposals: number
   totalStaked: string
+  // Issue #281: what fraction of active members' total contributed capital
+  // is currently staked — `totalStaked / totalContribution` over non-exited
+  // members, as a plain 0..1 ratio (0 when there is no contribution to
+  // divide by). `totalContribution` is exposed alongside it so a client
+  // doesn't have to re-derive the denominator to show both figures.
+  totalContribution: string
+  stakingRatio: number
   // Lifetime money figures (issue #24), as decimal strings like every other
   // on-chain amount. `interestCollected` is interest the treasury took in;
   // the amount actually credited to members is slightly less because the
@@ -180,8 +251,14 @@ export interface DAOStats {
   valueDefaulted: string
   // Quarantined-event count (issue #43) — a handler that deterministically
   // throws no longer wedges the indexer forever; this is the "we quarantined
-  // N events" signal a dashboard needs so that isn't invisible.
+  // N events" signal a dashboard needs so that isn't invisible. Issue #171:
+  // now counts distinct failing events, not failure count (one event can fail
+  // multiple times but is counted once).
   quarantinedEvents: number
+  // Issue #174: timestamp when quarantine last escalated to per-event folding.
+  // An operator should alert when this transitions from null to non-null,
+  // signaling data loss in one or more derived tables.
+  quarantineEscalatedAt: string | null
   // `lastIndexedLedger` is the highest ledger actually folded; `observedTipLedger`
   // is the RPC's most recently observed chain tip (issue #45) — "folded to X,
   // chain is at Y" is the useful pair for gauging indexer lag.
@@ -193,4 +270,32 @@ export interface DAOStats {
   estimatedLagSeconds: number | null
   secondsSinceUpdate: number | null
   indexerStale: boolean
+  // Open SSE stream connections on this process (issue #156). In-process
+  // only — with more than one API instance the figures are per-instance.
+  connectedStreams: number
+  // Count of failed stream NOTIFYs since process start (issue #169).
+  // In-process only, same caveat as connectedStreams above.
+  notificationFailures: number
+  // Issue #191: a ledger discontinuity the worker halted on and no operator
+  // has cleared yet. Distinct from `indexerStale`: the worker stopped on
+  // purpose, and restarting it will not help — see docs/REORG_RECOVERY.md.
+  reorgDetected: boolean
+  reorgHalt: ReorgHaltSummary | null
+  /** Present only when CONTRACT_IDS configures more than one contract. */
+  contracts?: Record<string, {
+    lastIndexedLedger: number | null
+    observedTipLedger: number | null
+    ledgersBehind: number | null
+    quarantinedEvents: number
+    quarantineEscalatedAt: string | null
+    reorgDetected: boolean
+  }>
+}
+
+/** The uncleared discontinuity surfaced by `/ready` and `/api/stats` (issue #191). */
+export interface ReorgHaltSummary {
+  detectedAt: string
+  contractId: string
+  lastLedger: number | null
+  detail: string
 }

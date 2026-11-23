@@ -1,7 +1,44 @@
 import type { PoolClient } from 'pg'
+import { SpanStatusCode } from '@opentelemetry/api'
 import { isKnownSymbol, warnUnknownSymbol, type DecodedEvent } from '../stellar/events.js'
-import { notifyStreamClients, STREAM_CHANNELS, type StreamChannel } from '../api/stream.js'
+import { STREAM_CHANNELS, type StreamChannel } from '../api/stream.js'
+import { getTracer } from '../telemetry.js'
 import type { NotificationType } from '../types.js'
+import { createHistoryCache } from '../api/history-cache.js'
+
+async function incrementDailyLoanStats(
+  client: PoolClient,
+  ev: DecodedEvent,
+  deltas: {
+    loansOriginated?: number
+    principalLent?: string
+    principalRepaid?: string
+    defaultsCount?: number
+    valueDefaulted?: string
+  }
+): Promise<void> {
+  await client.query(
+    `INSERT INTO daily_loan_stats
+       (day, loans_originated, principal_lent, principal_repaid, defaults_count, value_defaulted)
+     VALUES (($1::timestamptz AT TIME ZONE 'UTC')::date, $2, $3, $4, $5, $6)
+     ON CONFLICT (day) DO UPDATE SET
+       loans_originated = daily_loan_stats.loans_originated + EXCLUDED.loans_originated,
+       principal_lent = daily_loan_stats.principal_lent + EXCLUDED.principal_lent,
+       principal_repaid = daily_loan_stats.principal_repaid + EXCLUDED.principal_repaid,
+       defaults_count = daily_loan_stats.defaults_count + EXCLUDED.defaults_count,
+       value_defaulted = daily_loan_stats.value_defaulted + EXCLUDED.value_defaulted`,
+    [
+      ev.closedAt,
+      deltas.loansOriginated ?? 0,
+      deltas.principalLent ?? '0',
+      deltas.principalRepaid ?? '0',
+      deltas.defaultsCount ?? 0,
+      deltas.valueDefaulted ?? '0',
+    ]
+  )
+  const historyCache = createHistoryCache()
+  await historyCache.invalidate()
+}
 
 // Helpers ------------------------------------------------------------------
 //
@@ -33,7 +70,7 @@ export class FieldValidationError extends Error {
   }
 }
 
-function requireAddr(ev: DecodedEvent, field: string): string {
+export function requireAddr(ev: DecodedEvent, field: string): string {
   const v = ev.fields[field]
   if (typeof v !== 'string' || v === '') {
     throw new FieldValidationError(ev, field, `must be a non-empty address string, got ${JSON.stringify(v)}`)
@@ -41,19 +78,29 @@ function requireAddr(ev: DecodedEvent, field: string): string {
   return v
 }
 
-function requireId(ev: DecodedEvent, field: string): number {
+export function requireId(ev: DecodedEvent, field: string): number {
   const v = ev.fields[field]
-  const n = Number(v)
-  if (v == null || !Number.isFinite(n) || !Number.isInteger(n)) {
+  // Gate on the value's *type* before coercing, not only on the coerced
+  // result. `Number()` accepts booleans and arrays, so the old
+  // `Number.isInteger(Number(v))` check silently turned `true` into id 1,
+  // `[]` into id 0 and `[5]` into id 5 — the same "this event didn't decode,
+  // write something plausible anyway" failure issue #42 is about, one level
+  // down. Contract ids are u32 and decode to a JS number; a plain
+  // decimal-integer string is also accepted because `toJsonSafe` stringifies
+  // any bigint that reaches it (events.ts).
+  const isIntLike =
+    (typeof v === 'number' && Number.isInteger(v)) ||
+    (typeof v === 'string' && /^\d+$/.test(v))
+  if (!isIntLike) {
     throw new FieldValidationError(ev, field, `must be a finite integer id, got ${JSON.stringify(v)}`)
   }
-  return n
+  return Number(v)
 }
 
 /** i128 amounts arrive as decimal-integer strings (bigints are stringified
  *  upstream in toJsonSafe) or, for small values, as a JS number. Never
  *  negative — every amount field here is a magnitude, not a signed delta. */
-function requireAmount(ev: DecodedEvent, field: string): string {
+export function requireAmount(ev: DecodedEvent, field: string): string {
   const v = ev.fields[field]
   const s = typeof v === 'number' && Number.isFinite(v) ? String(v) : v
   if (typeof s !== 'string' || !/^\d+$/.test(s)) {
@@ -62,7 +109,7 @@ function requireAmount(ev: DecodedEvent, field: string): string {
   return s
 }
 
-function requireBool(ev: DecodedEvent, field: string): boolean {
+export function requireBool(ev: DecodedEvent, field: string): boolean {
   const v = ev.fields[field]
   if (typeof v !== 'boolean') {
     throw new FieldValidationError(ev, field, `must be a boolean, got ${JSON.stringify(v)}`)
@@ -85,7 +132,7 @@ function normalizeProposalKind(v: unknown): 'loan' | 'treasury' | null {
   return lower === 'loan' || lower === 'treasury' ? lower : null
 }
 
-function requireProposalKind(ev: DecodedEvent, field: string): 'loan' | 'treasury' {
+export function requireProposalKind(ev: DecodedEvent, field: string): 'loan' | 'treasury' {
   const kind = normalizeProposalKind(ev.fields[field])
   if (kind === null) {
     throw new FieldValidationError(ev, field, `must be a ProposalKind ("Loan"/"Treasury"), got ${JSON.stringify(ev.fields[field])}`)
@@ -102,10 +149,12 @@ async function notify(
   message: string
 ): Promise<void> {
   if (!address) return
+  // Issue #271: use ON CONFLICT to prevent duplicate notifications during replay
   await client.query(
-    `INSERT INTO notifications (address, type, title, message, ledger, tx_hash)
-     VALUES ($1, $2, $3, $4, $5, $6)`,
-    [address, type, title, message, ev.ledger, ev.txHash]
+    `INSERT INTO notifications (address, type, title, message, ledger, tx_hash, event_id)
+     VALUES ($1, $2, $3, $4, $5, $6, $7)
+     ON CONFLICT (event_id, address) WHERE event_id IS NOT NULL DO NOTHING`,
+    [address, type, title, message, ev.ledger, ev.txHash, ev.id]
   )
 }
 
@@ -124,7 +173,20 @@ async function notify(
 // Contract-published voting weight, once ourdao-contracts adds it to the vote
 // events (see the linked issue there). Until then the field decodes as
 // null/undefined and every vote counts as weight 1, same as before.
-const weightOf = (f: Record<string, unknown>): string => (f.weight == null ? '1' : str(f.weight))
+// When present, weight must be validated as an amount (issue #136) to
+// ensure a malformed value quarantines the event rather than silently
+// defaulting to zero.
+const weightOf = (ev: DecodedEvent): string => {
+  const weight = ev.fields.weight
+  if (weight == null) return '1'
+  // Validate weight as an amount when present to catch malformed values
+  const v = weight
+  const s = typeof v === 'number' && Number.isFinite(v) ? String(v) : v
+  if (typeof s !== 'string' || !/^\d+$/.test(s)) {
+    throw new FieldValidationError(ev, 'weight', `must be a non-negative decimal-integer amount, got ${JSON.stringify(v)}`)
+  }
+  return s
+}
 
 type Handler = (client: PoolClient, ev: DecodedEvent) => Promise<void>
 
@@ -217,14 +279,68 @@ const handlers: Record<string, Handler> = {
   async loan_vote(client, ev) {
     const proposalId = requireId(ev, 'proposal_id')
     const support = requireBool(ev, 'support')
-    const f = ev.fields
     const column = support ? 'votes_for' : 'votes_against'
+    // Issue #265: Default null weight to 1 without corrupting cumulative vote tallies.
+    // weightOf() already handles this safely by returning '1' when weight is null/undefined.
+    const weight = weightOf(ev)
     await client.query(
       `UPDATE loan_proposals
          SET ${column} = ${column} + $2, voter_count = voter_count + 1, updated_at = now()
        WHERE id = $1`,
-      [proposalId, weightOf(f)]
+      [proposalId, weight]
     )
+  },
+
+  async loan_wait(client, ev) {
+    const id = requireId(ev, 'id')
+    // The proposal reached quorum but the treasury couldn't cover the
+    // disbursement yet (loans.rs::vote_on_loan_proposal / approve_and_disburse)
+    // — issue #125. A later permissionless `disburse_approved_loan` call
+    // resolves this and republishes `loan_appr`, which the handler above
+    // already folds unconditionally regardless of the proposal's prior
+    // status. Guard on `pending` so a re-delivered `loan_wait` is a no-op.
+    const updated = await client.query<{ borrower: string }>(
+      `UPDATE loan_proposals SET status = 'approved_pending_disbursement', updated_at = now()
+       WHERE id = $1 AND status = 'pending'
+       RETURNING borrower`,
+      [id]
+    )
+    const borrower = updated.rows[0]?.borrower
+    if (borrower) {
+      await notify(
+        client,
+        ev,
+        borrower,
+        'info',
+        'Loan approved, awaiting funds',
+        `Proposal #${id} reached quorum but the treasury can't cover it yet — it will be disbursed once funds are available.`
+      )
+    }
+  },
+
+  async loan_rej(client, ev) {
+    const id = requireId(ev, 'id')
+    // Early rejection from inside the same vote call as loan_wait above, when
+    // the votes still outstanding can no longer mathematically reach quorum
+    // (issue #124) — distinct from loan_exp's permissionless-keeper path
+    // below. Guard on `pending` so a re-delivered `loan_rej` is a no-op.
+    const updated = await client.query<{ borrower: string }>(
+      `UPDATE loan_proposals SET status = 'rejected', updated_at = now()
+       WHERE id = $1 AND status = 'pending'
+       RETURNING borrower`,
+      [id]
+    )
+    const borrower = updated.rows[0]?.borrower
+    if (borrower) {
+      await notify(
+        client,
+        ev,
+        borrower,
+        'warning',
+        'Loan proposal rejected',
+        `Proposal #${id} could no longer reach quorum and was rejected.`
+      )
+    }
   },
 
   async loan_appr(client, ev) {
@@ -265,11 +381,15 @@ const handlers: Record<string, Handler> = {
     // Fold principal lent once per loan (issue #24). `xmax = 0` is true only
     // when this was a fresh INSERT, not the ON CONFLICT UPDATE branch — so a
     // re-delivered `loan_appr` doesn't double-count.
+    // Issue #269: acquire row-level lock on dao_totals before updating to prevent
+    // concurrent transactions from creating race conditions.
     if (loanIns.rows[0]?.is_new) {
+      await client.query('SELECT 1 FROM dao_totals WHERE id = 1 FOR UPDATE')
       await client.query(
         `UPDATE dao_totals SET principal_lent = principal_lent + $1, updated_at = now() WHERE id = 1`,
         [amount]
       )
+      await incrementDailyLoanStats(client, ev, { loansOriginated: 1, principalLent: amount })
     }
     await client.query(
       `UPDATE members SET has_active_loan = true WHERE address = $1`,
@@ -298,11 +418,15 @@ const handlers: Record<string, Handler> = {
       [loanId, outstanding, status, ev.ledger]
     )
     const loan = upd.rows[0]
+    // Issue #269: acquire row-level lock on dao_totals before updating to prevent
+    // concurrent transactions from creating race conditions.
     if (status === 'repaid' && loan && !loan.was_repaid) {
+      await client.query('SELECT 1 FROM dao_totals WHERE id = 1 FOR UPDATE')
       await client.query(
         `UPDATE dao_totals SET principal_repaid = principal_repaid + $1, updated_at = now() WHERE id = 1`,
         [loan.amount]
       )
+      await incrementDailyLoanStats(client, ev, { principalRepaid: loan.amount })
     }
     if (status === 'repaid') {
       await client.query(`UPDATE members SET has_active_loan = false WHERE address = $1`, [borrower])
@@ -333,10 +457,17 @@ const handlers: Record<string, Handler> = {
     // The status guard above already makes this fold idempotent (issue #24):
     // value defaulted is the loan's outstanding balance at the moment it
     // defaulted.
+    // Issue #269: acquire row-level lock on dao_totals before updating to prevent
+    // concurrent transactions from creating race conditions.
+    await client.query('SELECT 1 FROM dao_totals WHERE id = 1 FOR UPDATE')
     await client.query(
       `UPDATE dao_totals SET value_defaulted = value_defaulted + $1, updated_at = now() WHERE id = 1`,
       [updated.rows[0]?.outstanding ?? '0']
     )
+    await incrementDailyLoanStats(client, ev, {
+      defaultsCount: 1,
+      valueDefaulted: updated.rows[0]?.outstanding ?? '0',
+    })
 
     await client.query(
       `UPDATE members
@@ -354,6 +485,26 @@ const handlers: Record<string, Handler> = {
       'error',
       'Loan defaulted',
       `Loan #${id} was marked defaulted; a penalty of ${penalty} was applied to your contribution.`
+    )
+  },
+
+  async loan_exp(client, ev) {
+    const proposalId = requireId(ev, 'proposal_id')
+    const borrower = requireAddr(ev, 'borrower')
+    // Guard on `status = 'pending'` so a re-delivered `loan_exp` event is a clean no-op.
+    const updated = await client.query(
+      `UPDATE loan_proposals SET status = 'rejected', updated_at = now() WHERE id = $1 AND status = 'pending'`,
+      [proposalId]
+    )
+    if (updated.rowCount === 0) return
+
+    await notify(
+      client,
+      ev,
+      borrower,
+      'warning',
+      'Loan proposal expired',
+      `Proposal #${proposalId} expired without reaching quorum.`
     )
   },
 
@@ -380,7 +531,10 @@ const handlers: Record<string, Handler> = {
        ON CONFLICT (event_id) DO NOTHING`,
       [ev.id, ev.ledger, amount, num(f.active), ev.txHash]
     )
+    // Issue #269: acquire row-level lock on dao_totals before updating to prevent
+    // concurrent transactions from creating race conditions.
     if (inserted.rowCount === 1) {
+      await client.query('SELECT 1 FROM dao_totals WHERE id = 1 FOR UPDATE')
       await client.query(
         `UPDATE dao_totals
             SET interest_collected = interest_collected + $1, updated_at = now()
@@ -408,14 +562,60 @@ const handlers: Record<string, Handler> = {
   async tre_vote(client, ev) {
     const id = requireId(ev, 'id')
     const support = requireBool(ev, 'support')
-    const f = ev.fields
     const column = support ? 'votes_for' : 'votes_against'
     await client.query(
       `UPDATE treasury_proposals
          SET ${column} = ${column} + $2, voter_count = voter_count + 1, updated_at = now()
        WHERE id = $1`,
-      [id, weightOf(f)]
+      [id, weightOf(ev)]
     )
+  },
+
+  async tre_wait(client, ev) {
+    const id = requireId(ev, 'id')
+    // Treasury equivalent of loan_wait above (issue #125) — reached quorum
+    // but `execute` failed because the treasury can't cover it yet. A later
+    // `execute_treasury_proposal` call resolves this and republishes
+    // `tre_exec`, folded unconditionally by the handler below.
+    const updated = await client.query<{ destination: string }>(
+      `UPDATE treasury_proposals SET status = 'approved_pending_disbursement', updated_at = now()
+       WHERE id = $1 AND status = 'pending'
+       RETURNING destination`,
+      [id]
+    )
+    const destination = updated.rows[0]?.destination
+    if (destination) {
+      await notify(
+        client,
+        ev,
+        destination,
+        'info',
+        'Treasury withdrawal approved, awaiting funds',
+        `Proposal #${id} reached quorum but the treasury can't cover it yet — it will execute once funds are available.`
+      )
+    }
+  },
+
+  async tre_rej(client, ev) {
+    const id = requireId(ev, 'id')
+    // Treasury equivalent of loan_rej above (issue #124).
+    const updated = await client.query<{ destination: string }>(
+      `UPDATE treasury_proposals SET status = 'rejected', updated_at = now()
+       WHERE id = $1 AND status = 'pending'
+       RETURNING destination`,
+      [id]
+    )
+    const destination = updated.rows[0]?.destination
+    if (destination) {
+      await notify(
+        client,
+        ev,
+        destination,
+        'warning',
+        'Treasury proposal rejected',
+        `Proposal #${id} could no longer reach quorum and was rejected.`
+      )
+    }
   },
 
   async tre_exec(client, ev) {
@@ -506,60 +706,90 @@ const handlers: Record<string, Handler> = {
     // A revealed commit-reveal ballot counts like a treasury vote.
     const proposalId = requireId(ev, 'proposal_id')
     const support = requireBool(ev, 'support')
-    const f = ev.fields
     const column = support ? 'votes_for' : 'votes_against'
     await client.query(
       `UPDATE treasury_proposals
          SET ${column} = ${column} + $2, voter_count = voter_count + 1, updated_at = now()
        WHERE id = $1`,
-      [proposalId, weightOf(f)]
+      [proposalId, weightOf(ev)]
     )
   },
 }
 
+// Map event symbols to the stream channel a fold of that symbol touches
+// (issue #63). Read by `applyEvent` below to decide which channel to report
+// as changed — it no longer sends the NOTIFY itself (issue #169).
+export const channelMap: Record<string, StreamChannel | StreamChannel[]> = {
+  joined: STREAM_CHANNELS.members,
+  exited: STREAM_CHANNELS.members,
+  staked: STREAM_CHANNELS.members,
+  unstaked: STREAM_CHANNELS.members,
+  claimed: STREAM_CHANNELS.members,
+  name_reg: STREAM_CHANNELS.members,
+
+  loan_req: STREAM_CHANNELS.loan_proposals,
+  loan_edit: STREAM_CHANNELS.loan_proposals,
+  loan_vote: STREAM_CHANNELS.loan_proposals,
+  loan_wait: STREAM_CHANNELS.loan_proposals,
+  loan_rej: STREAM_CHANNELS.loan_proposals,
+  loan_appr: [STREAM_CHANNELS.loan_proposals, STREAM_CHANNELS.loans],
+  loan_exp: STREAM_CHANNELS.loan_proposals,
+  loan_rpy: STREAM_CHANNELS.loans,
+  loan_dflt: STREAM_CHANNELS.loans,
+
+  tre_prop: STREAM_CHANNELS.treasury_proposals,
+  tre_vote: STREAM_CHANNELS.treasury_proposals,
+  committed: STREAM_CHANNELS.treasury_proposals,
+  revealed: STREAM_CHANNELS.treasury_proposals,
+  tre_exec: STREAM_CHANNELS.treasury_proposals,
+  tre_wait: STREAM_CHANNELS.treasury_proposals,
+  tre_rej: STREAM_CHANNELS.treasury_proposals,
+
+  interest: STREAM_CHANNELS.interest,
+
+  doc_attn: STREAM_CHANNELS.documents,
+}
+
 /** Apply one decoded event's side effects. Unknown symbols are a no-op
- *  (the raw event is still persisted by the caller). */
-export async function applyEvent(client: PoolClient, ev: DecodedEvent): Promise<void> {
+ *  (the raw event is still persisted by the caller). Returns the stream
+ *  channel(s) this event's fold touches, if any — the caller sends the actual
+ *  NOTIFY once its own transaction has committed (issue #169), rather than
+ *  this function sending it on `client`, the fold transaction's own
+ *  connection. A NOTIFY that fails or errors mid-transaction on that same
+ *  connection can otherwise poison it for Postgres's later statements in
+ *  that same transaction, which the "log but don't throw" comment this
+ *  replaced didn't account for. */
+export async function applyEvent(
+  client: PoolClient,
+  ev: DecodedEvent
+): Promise<StreamChannel | StreamChannel[] | undefined> {
   // A symbol the catalog doesn't know is a deliberate no-op (raw event already
   // stored by the caller) — but announce it once so a new contract event
   // can't quietly leave derived state incomplete (issue #39).
   if (!isKnownSymbol(ev.symbol)) warnUnknownSymbol(ev)
 
   const handler = handlers[ev.symbol]
-  if (handler) await handler(client, ev)
+  // Issue #288: one span per event, whether or not a handler actually runs
+  // for it (an unknown symbol is still worth seeing in a trace) — visibility
+  // into which handlers are slowest during high transaction volume is the
+  // whole point, and skipping the no-handler case would silently exclude
+  // whatever fraction of events those are from that picture.
+  await getTracer().startActiveSpan('indexer.apply_event', async (span) => {
+    span.setAttribute('event.symbol', ev.symbol)
+    if (typeof ev.ledger === 'number') span.setAttribute('event.ledger', ev.ledger)
+    span.setAttribute('event.has_handler', handler !== undefined)
+    const startedAt = performance.now()
+    try {
+      if (handler) await handler(client, ev)
+    } catch (err) {
+      span.recordException(err instanceof Error ? err : String(err))
+      span.setStatus({ code: SpanStatusCode.ERROR })
+      throw err
+    } finally {
+      span.setAttribute('event.handler_duration_ms', performance.now() - startedAt)
+      span.end()
+    }
+  })
 
-  // Emit NOTIFY for stream subscribers (issue #63)
-  // Map event symbols to stream channels
-  const channelMap: Record<string, StreamChannel> = {
-    joined: STREAM_CHANNELS.members,
-    exited: STREAM_CHANNELS.members,
-    staked: STREAM_CHANNELS.members,
-    unstaked: STREAM_CHANNELS.members,
-    claimed: STREAM_CHANNELS.members,
-    
-    loan_req: STREAM_CHANNELS.loan_proposals,
-    loan_edit: STREAM_CHANNELS.loan_proposals,
-    loan_vote: STREAM_CHANNELS.loan_proposals,
-    loan_appr: STREAM_CHANNELS.loan_proposals,
-    loan_reject: STREAM_CHANNELS.loan_proposals,
-    loan_disburse: STREAM_CHANNELS.loans,
-    loan_repay: STREAM_CHANNELS.loans,
-    loan_default: STREAM_CHANNELS.loans,
-    
-    treasury_req: STREAM_CHANNELS.treasury_proposals,
-    treasury_vote: STREAM_CHANNELS.treasury_proposals,
-    treasury_appr: STREAM_CHANNELS.treasury_proposals,
-    treasury_reject: STREAM_CHANNELS.treasury_proposals,
-    
-    interest: STREAM_CHANNELS.interest,
-  }
-
-  const channel = channelMap[ev.symbol]
-  if (channel) {
-    await notifyStreamClients(client, channel, {
-      symbol: ev.symbol,
-      ledger: ev.ledger,
-      timestamp: Date.now(),
-    })
-  }
+  return channelMap[ev.symbol]
 }

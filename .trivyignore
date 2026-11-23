@@ -1,0 +1,26 @@
+# Trivy vulnerability allowlist for ourdao-backend container image.
+#
+# POLICY:
+# Every ignored CVE must:
+# 1. Have a clear rationale explaining why it is an acceptable risk or a false positive.
+# 2. Link to an upstream tracking issue or advisory.
+# 3. Specify an expiration date (format: exp:YYYY-MM-DD) after which it must be re-evaluated.
+#
+# Example:
+# # CVE-2026-XXXX: Busybox unaligned read, not reachable via node runtime. Tracking: #000
+# # CVE-2026-XXXX exp:2026-12-31
+#
+# NOTE: This file is consumed by the Trivy scan step in .github/workflows/ci.yml.
+# The CI workflow builds the production Dockerfile and runs Trivy against the
+# resulting image, failing the build on any HIGH or CRITICAL severity CVE that
+# is not explicitly allowlisted below (see docs/DEPLOYMENT.md's "Container
+# security and image scanning" section).
+#
+# To add a new entry, append it at the bottom of this file using the format:
+#   # CVE-YYYY-NNNNN: <rationale>. Tracking: <link or issue ref>
+#   # CVE-YYYY-NNNNN exp:YYYY-MM-DD
+#
+# Entries past their expiration date must be re-evaluated or removed; the CI
+# scan treats expired entries as active findings.
+
+# (No active allowlist entries.)

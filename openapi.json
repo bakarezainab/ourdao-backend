@@ -1,0 +1,1851 @@
+{
+  "openapi": "3.0.3",
+  "info": {
+    "title": "OurDAO Backend API",
+    "description": "Off-chain indexer + read API for the OurDAO lending DAO on Stellar/Soroban",
+    "version": "0.2.0"
+  },
+  "components": {
+    "schemas": {}
+  },
+  "paths": {
+    "/api/stream": {
+      "get": {
+        "responses": {
+          "200": {
+            "description": "Default Response"
+          }
+        }
+      }
+    },
+    "/api/auth/challenge": {
+      "get": {
+        "responses": {
+          "200": {
+            "description": "Default Response"
+          }
+        }
+      }
+    },
+    "/api/members": {
+      "get": {
+        "responses": {
+          "200": {
+            "description": "Default Response"
+          }
+        }
+      }
+    },
+    "/api/members/{address}": {
+      "get": {
+        "parameters": [
+          {
+            "schema": {
+              "type": "string"
+            },
+            "in": "path",
+            "name": "address",
+            "required": true
+          }
+        ],
+        "responses": {
+          "200": {
+            "description": "Default Response"
+          }
+        }
+      }
+    },
+    "/api/members/{address}/summary": {
+      "get": {
+        "parameters": [
+          {
+            "schema": {
+              "type": "string"
+            },
+            "in": "path",
+            "name": "address",
+            "required": true
+          }
+        ],
+        "responses": {
+          "200": {
+            "description": "Default Response"
+          }
+        }
+      }
+    },
+    "/api/members/{address}/activity": {
+      "get": {
+        "summary": "A member's cross-entity activity feed",
+        "tags": [
+          "members"
+        ],
+        "parameters": [
+          {
+            "schema": {
+              "type": "string"
+            },
+            "in": "query",
+            "name": "limit",
+            "required": false,
+            "description": "Max rows to return (1-200, default 50)."
+          },
+          {
+            "schema": {
+              "type": "string"
+            },
+            "in": "query",
+            "name": "before",
+            "required": false,
+            "description": "Pagination cursor: return rows from ledgers strictly below this value."
+          },
+          {
+            "schema": {
+              "type": "string",
+              "enum": [
+                "joined",
+                "exited",
+                "claimed",
+                "staked",
+                "unstaked",
+                "name_reg",
+                "loan_req",
+                "loan_edit",
+                "loan_vote",
+                "loan_appr",
+                "loan_rpy",
+                "loan_dflt",
+                "loan_exp",
+                "tre_vote",
+                "committed",
+                "revealed"
+              ]
+            },
+            "in": "query",
+            "name": "symbol",
+            "required": false,
+            "description": "Narrow the feed to one activity kind (issue #193). Must be one of the member-activity symbols; anything else is a 400."
+          },
+          {
+            "schema": {
+              "type": "string"
+            },
+            "in": "path",
+            "name": "address",
+            "required": true
+          }
+        ],
+        "responses": {
+          "200": {
+            "description": "Default Response"
+          }
+        }
+      }
+    },
+    "/api/proposals/loan": {
+      "get": {
+        "parameters": [
+          {
+            "schema": {
+              "type": "string",
+              "enum": [
+                "pending",
+                "approved",
+                "rejected",
+                "cancelled",
+                "approved_pending_disbursement"
+              ]
+            },
+            "in": "query",
+            "name": "status",
+            "required": false,
+            "description": "Filter by loan proposal status (issue #593). Must be one of LOAN_PROPOSAL_STATUSES; anything else is a 400."
+          },
+          {
+            "schema": {
+              "type": "string",
+              "enum": [
+                "asc",
+                "desc"
+              ],
+              "default": "desc"
+            },
+            "in": "query",
+            "name": "order",
+            "required": false,
+            "description": "Sort ordering by proposal id (asc or desc, default desc) (issue #508)."
+          },
+          {
+            "schema": {
+              "type": "string"
+            },
+            "in": "query",
+            "name": "before",
+            "required": false,
+            "description": "Pagination cursor for descending ordering: return rows with id strictly less than this value (issue #508)."
+          },
+          {
+            "schema": {
+              "type": "string"
+            },
+            "in": "query",
+            "name": "after",
+            "required": false,
+            "description": "Pagination cursor for ascending ordering: return rows with id strictly greater than this value (issue #508)."
+          },
+          {
+            "schema": {
+              "type": "string"
+            },
+            "in": "query",
+            "name": "limit",
+            "required": false,
+            "description": "Max rows to return (1-200, default 50)."
+          }
+        ],
+        "responses": {
+          "200": {
+            "description": "Default Response"
+          }
+        }
+      }
+    },
+    "/api/proposals/loan/{id}": {
+      "get": {
+        "parameters": [
+          {
+            "schema": {
+              "type": "string"
+            },
+            "in": "path",
+            "name": "id",
+            "required": true
+          }
+        ],
+        "responses": {
+          "200": {
+            "description": "Default Response"
+          }
+        }
+      }
+    },
+    "/api/loans": {
+      "get": {
+        "parameters": [
+          {
+            "schema": {
+              "type": "string",
+              "enum": [
+                "active",
+                "repaid",
+                "defaulted"
+              ]
+            },
+            "in": "query",
+            "name": "status",
+            "required": false,
+            "description": "Filter by loan status."
+          },
+          {
+            "schema": {
+              "type": "string",
+              "enum": [
+                "asc",
+                "desc"
+              ],
+              "default": "desc"
+            },
+            "in": "query",
+            "name": "order",
+            "required": false,
+            "description": "Sort ordering by loan id (asc or desc, default desc) (issue #508)."
+          },
+          {
+            "schema": {
+              "type": "string"
+            },
+            "in": "query",
+            "name": "before",
+            "required": false,
+            "description": "Pagination cursor for descending ordering: return rows with id strictly less than this value (issue #508)."
+          },
+          {
+            "schema": {
+              "type": "string"
+            },
+            "in": "query",
+            "name": "after",
+            "required": false,
+            "description": "Pagination cursor for ascending ordering: return rows with id strictly greater than this value (issue #508)."
+          },
+          {
+            "schema": {
+              "type": "string"
+            },
+            "in": "query",
+            "name": "limit",
+            "required": false,
+            "description": "Max rows to return (1-200, default 50)."
+          },
+          {
+            "schema": {
+              "type": "string"
+            },
+            "in": "query",
+            "name": "borrower",
+            "required": false,
+            "description": "Filter by borrower Stellar address."
+          }
+        ],
+        "responses": {
+          "200": {
+            "description": "Default Response"
+          }
+        }
+      }
+    },
+    "/api/loans/{id}": {
+      "get": {
+        "parameters": [
+          {
+            "schema": {
+              "type": "string"
+            },
+            "in": "path",
+            "name": "id",
+            "required": true
+          }
+        ],
+        "responses": {
+          "200": {
+            "description": "Default Response"
+          }
+        }
+      }
+    },
+    "/api/loans/{id}/timeline": {
+      "get": {
+        "summary": "A loan's full event history",
+        "tags": [
+          "loans"
+        ],
+        "parameters": [
+          {
+            "schema": {
+              "type": "string"
+            },
+            "in": "path",
+            "name": "id",
+            "required": true
+          }
+        ],
+        "responses": {
+          "200": {
+            "description": "Default Response",
+            "content": {
+              "application/json": {
+                "schema": {
+                  "type": "object",
+                  "properties": {
+                    "timeline": {
+                      "type": "array",
+                      "items": {
+                        "type": "object",
+                        "properties": {
+                          "id": {
+                            "type": "string"
+                          },
+                          "symbol": {
+                            "type": "string"
+                          },
+                          "ledger": {
+                            "type": "integer"
+                          },
+                          "timestamp": {
+                            "type": "string"
+                          },
+                          "tx_hash": {
+                            "type": "string",
+                            "nullable": true
+                          },
+                          "fields": {
+                            "type": "object",
+                            "additionalProperties": true
+                          }
+                        }
+                      }
+                    },
+                    "truncated": {
+                      "type": "boolean",
+                      "description": "true when more than 2000 rows matched and the response was capped."
+                    },
+                    "total": {
+                      "type": "integer",
+                      "description": "Total matching rows, independent of the cap."
+                    }
+                  }
+                }
+              }
+            }
+          }
+        }
+      }
+    },
+    "/api/proposals/treasury": {
+      "get": {
+        "parameters": [
+          {
+            "schema": {
+              "type": "string",
+              "enum": [
+                "pending",
+                "executed",
+                "rejected",
+                "approved_pending_disbursement"
+              ]
+            },
+            "in": "query",
+            "name": "status",
+            "required": false,
+            "description": "Filter by treasury proposal status (issue #593). Must be one of TREASURY_PROPOSAL_STATUSES; anything else is a 400."
+          },
+          {
+            "schema": {
+              "type": "string",
+              "enum": [
+                "asc",
+                "desc"
+              ],
+              "default": "desc"
+            },
+            "in": "query",
+            "name": "order",
+            "required": false,
+            "description": "Sort ordering by proposal id (asc or desc, default desc) (issue #508)."
+          },
+          {
+            "schema": {
+              "type": "string"
+            },
+            "in": "query",
+            "name": "before",
+            "required": false,
+            "description": "Pagination cursor for descending ordering: return rows with id strictly less than this value (issue #508)."
+          },
+          {
+            "schema": {
+              "type": "string"
+            },
+            "in": "query",
+            "name": "after",
+            "required": false,
+            "description": "Pagination cursor for ascending ordering: return rows with id strictly greater than this value (issue #508)."
+          },
+          {
+            "schema": {
+              "type": "string"
+            },
+            "in": "query",
+            "name": "limit",
+            "required": false,
+            "description": "Max rows to return (1-200, default 50)."
+          }
+        ],
+        "responses": {
+          "200": {
+            "description": "Default Response"
+          }
+        }
+      }
+    },
+    "/api/proposals/treasury/{id}": {
+      "get": {
+        "parameters": [
+          {
+            "schema": {
+              "type": "string"
+            },
+            "in": "path",
+            "name": "id",
+            "required": true
+          }
+        ],
+        "responses": {
+          "200": {
+            "description": "Default Response"
+          }
+        }
+      }
+    },
+    "/api/proposals/treasury/{id}/timeline": {
+      "get": {
+        "summary": "A treasury proposal's full event history",
+        "tags": [
+          "proposals"
+        ],
+        "parameters": [
+          {
+            "schema": {
+              "type": "string"
+            },
+            "in": "path",
+            "name": "id",
+            "required": true
+          }
+        ],
+        "responses": {
+          "200": {
+            "description": "Default Response",
+            "content": {
+              "application/json": {
+                "schema": {
+                  "type": "object",
+                  "properties": {
+                    "timeline": {
+                      "type": "array",
+                      "items": {
+                        "type": "object",
+                        "properties": {
+                          "id": {
+                            "type": "string"
+                          },
+                          "symbol": {
+                            "type": "string"
+                          },
+                          "ledger": {
+                            "type": "integer"
+                          },
+                          "timestamp": {
+                            "type": "string"
+                          },
+                          "tx_hash": {
+                            "type": "string",
+                            "nullable": true
+                          },
+                          "fields": {
+                            "type": "object",
+                            "additionalProperties": true
+                          }
+                        }
+                      }
+                    },
+                    "truncated": {
+                      "type": "boolean",
+                      "description": "true when more than 2000 rows matched and the response was capped."
+                    },
+                    "total": {
+                      "type": "integer",
+                      "description": "Total matching rows, independent of the cap."
+                    }
+                  }
+                }
+              }
+            }
+          }
+        }
+      }
+    },
+    "/api/notifications": {
+      "get": {
+        "summary": "Array of notifications",
+        "tags": [
+          "notifications"
+        ],
+        "responses": {
+          "200": {
+            "description": "Default Response",
+            "content": {
+              "application/json": {
+                "schema": {
+                  "type": "array",
+                  "items": {
+                    "type": "object",
+                    "properties": {
+                      "id": {
+                        "type": "integer"
+                      },
+                      "address": {
+                        "type": "string"
+                      },
+                      "type": {
+                        "type": "string",
+                        "enum": [
+                          "success",
+                          "error",
+                          "warning",
+                          "info"
+                        ]
+                      },
+                      "title": {
+                        "type": "string"
+                      },
+                      "message": {
+                        "type": "string"
+                      },
+                      "ledger": {
+                        "type": "integer",
+                        "nullable": true
+                      },
+                      "tx_hash": {
+                        "type": "string",
+                        "nullable": true
+                      },
+                      "read": {
+                        "type": "boolean"
+                      },
+                      "event_id": {
+                        "type": "string",
+                        "nullable": true
+                      },
+                      "created_at": {
+                        "type": "string"
+                      }
+                    }
+                  }
+                }
+              }
+            }
+          },
+          "400": {
+            "description": "Default Response",
+            "content": {
+              "application/json": {
+                "schema": {
+                  "type": "object",
+                  "properties": {
+                    "error": {
+                      "type": "string"
+                    }
+                  }
+                }
+              }
+            }
+          }
+        }
+      }
+    },
+    "/api/events": {
+      "get": {
+        "summary": "Paginated event feed",
+        "tags": [
+          "events"
+        ],
+        "parameters": [
+          {
+            "schema": {
+              "type": "string",
+              "enum": [
+                "joined",
+                "exited",
+                "claimed",
+                "loan_req",
+                "loan_edit",
+                "loan_vote",
+                "loan_wait",
+                "loan_rej",
+                "loan_appr",
+                "loan_rpy",
+                "loan_dflt",
+                "loan_exp",
+                "interest",
+                "tre_prop",
+                "tre_vote",
+                "tre_wait",
+                "tre_rej",
+                "tre_exec",
+                "staked",
+                "unstaked",
+                "name_reg",
+                "committed",
+                "revealed",
+                "doc_attn",
+                "init",
+                "admin_add",
+                "admin_rem",
+                "threshold",
+                "policy",
+                "paused",
+                "unpaused"
+              ]
+            },
+            "in": "query",
+            "name": "symbol",
+            "required": false,
+            "description": "Narrow the feed to one event symbol (issue #592). Must be one of the known event symbols; anything else is a 400."
+          }
+        ],
+        "responses": {
+          "200": {
+            "description": "Default Response",
+            "content": {
+              "application/json": {
+                "schema": {
+                  "type": "object",
+                  "properties": {
+                    "events": {
+                      "type": "array",
+                      "items": {
+                        "type": "object",
+                        "properties": {
+                          "id": {
+                            "type": "string"
+                          },
+                          "ledger": {
+                            "type": "integer"
+                          },
+                          "closed_at": {
+                            "type": "string"
+                          },
+                          "contract_id": {
+                            "type": "string"
+                          },
+                          "symbol": {
+                            "type": "string"
+                          },
+                          "topics": {},
+                          "data": {},
+                          "tx_hash": {
+                            "type": "string",
+                            "nullable": true
+                          },
+                          "decode_error": {
+                            "type": "string",
+                            "nullable": true
+                          },
+                          "created_at": {
+                            "type": "string"
+                          }
+                        }
+                      }
+                    },
+                    "nextCursor": {
+                      "type": "string"
+                    }
+                  }
+                }
+              }
+            }
+          },
+          "400": {
+            "description": "Default Response",
+            "content": {
+              "application/json": {
+                "schema": {
+                  "type": "object",
+                  "properties": {
+                    "error": {
+                      "type": "string"
+                    }
+                  }
+                }
+              }
+            }
+          }
+        }
+      }
+    },
+    "/api/notifications/{id}/read": {
+      "patch": {
+        "parameters": [
+          {
+            "schema": {
+              "type": "string"
+            },
+            "in": "path",
+            "name": "id",
+            "required": true
+          }
+        ],
+        "responses": {
+          "200": {
+            "description": "Default Response"
+          }
+        }
+      }
+    },
+    "/api/notifications/read-all": {
+      "patch": {
+        "responses": {
+          "200": {
+            "description": "Default Response"
+          }
+        }
+      }
+    },
+    "/api/admin/log": {
+      "get": {
+        "summary": "Admin/governance audit log",
+        "tags": [
+          "admin"
+        ],
+        "description": "Raw events for admin/governance-lifecycle symbols only (init, admin add/remove, threshold, policy, pause/unpause) — a public audit trail read straight off the chain. Optionally scoped to one contract deployment.",
+        "parameters": [
+          {
+            "schema": {
+              "type": "string"
+            },
+            "in": "query",
+            "name": "limit",
+            "required": false,
+            "description": "Max rows to return (1-200, default 50)."
+          },
+          {
+            "schema": {
+              "type": "string"
+            },
+            "in": "query",
+            "name": "before",
+            "required": false,
+            "description": "Pagination cursor: return rows with a strictly smaller ledger than this value."
+          },
+          {
+            "schema": {
+              "type": "string"
+            },
+            "in": "query",
+            "name": "contract",
+            "required": false,
+            "description": "Restrict to one contract deployment id."
+          },
+          {
+            "schema": {
+              "type": "string",
+              "enum": [
+                "init",
+                "admin_add",
+                "admin_rem",
+                "threshold",
+                "policy",
+                "paused",
+                "unpaused"
+              ]
+            },
+            "in": "query",
+            "name": "symbol",
+            "required": false,
+            "description": "Filter by admin event symbol (issue #509). Must be one of ADMIN_EVENT_SYMBOLS; anything else is a 400."
+          }
+        ],
+        "responses": {
+          "200": {
+            "description": "Default Response",
+            "content": {
+              "application/json": {
+                "schema": {
+                  "type": "array",
+                  "items": {
+                    "type": "object",
+                    "properties": {
+                      "id": {
+                        "type": "string"
+                      },
+                      "ledger": {
+                        "type": "integer"
+                      },
+                      "closed_at": {
+                        "type": "string",
+                        "format": "date-time"
+                      },
+                      "contract_id": {
+                        "type": "string"
+                      },
+                      "symbol": {
+                        "type": "string"
+                      },
+                      "topics": {},
+                      "data": {},
+                      "tx_hash": {
+                        "type": "string",
+                        "nullable": true
+                      },
+                      "decode_error": {
+                        "type": "string",
+                        "nullable": true
+                      },
+                      "created_at": {
+                        "type": "string",
+                        "format": "date-time"
+                      }
+                    }
+                  }
+                }
+              }
+            }
+          },
+          "400": {
+            "description": "Default Response",
+            "content": {
+              "application/json": {
+                "schema": {
+                  "type": "object",
+                  "properties": {
+                    "error": {
+                      "type": "string"
+                    }
+                  }
+                }
+              }
+            }
+          }
+        }
+      }
+    },
+    "/api/interest": {
+      "get": {
+        "responses": {
+          "200": {
+            "description": "Default Response"
+          }
+        }
+      }
+    },
+    "/api/documents": {
+      "get": {
+        "responses": {
+          "200": {
+            "description": "Default Response"
+          }
+        }
+      }
+    },
+    "/api/admin/failed-events": {
+      "get": {
+        "summary": "Quarantined (deterministically-failed) events",
+        "tags": [
+          "admin"
+        ],
+        "description": "Events whose fold handler threw deterministically and were isolated rather than retried forever (issue #43) — the operator-facing view of the quarantine. Never includes the raw exception text; that is logged, not returned, so this endpoint stays safe to leave unauthenticated.",
+        "parameters": [
+          {
+            "schema": {
+              "type": "string"
+            },
+            "in": "query",
+            "name": "limit",
+            "required": false,
+            "description": "Max rows to return (1-200, default 50)."
+          },
+          {
+            "schema": {
+              "type": "string"
+            },
+            "in": "query",
+            "name": "before",
+            "required": false,
+            "description": "Pagination cursor: return rows with a strictly smaller id than this value."
+          },
+          {
+            "schema": {
+              "type": "string",
+              "enum": [
+                "true",
+                "false"
+              ]
+            },
+            "in": "query",
+            "name": "unresolved",
+            "required": false,
+            "description": "When \"true\", only rows a reindex/replay has not yet resolved."
+          },
+          {
+            "schema": {
+              "type": "string"
+            },
+            "in": "query",
+            "name": "symbol",
+            "required": false,
+            "description": "Only failures of events with this symbol (issue #192)."
+          },
+          {
+            "schema": {
+              "type": "string"
+            },
+            "in": "query",
+            "name": "contract",
+            "required": false,
+            "description": "Only failures from this contract deployment."
+          },
+          {
+            "schema": {
+              "type": "string"
+            },
+            "in": "query",
+            "name": "from_ledger",
+            "required": false,
+            "description": "Only failures from this ledger onwards (issue #192)."
+          },
+          {
+            "schema": {
+              "type": "string"
+            },
+            "in": "query",
+            "name": "to_ledger",
+            "required": false,
+            "description": "Only failures up to and including this ledger (issue #192). With from_ledger, the range may span at most 10000 ledgers."
+          }
+        ],
+        "responses": {
+          "200": {
+            "description": "Default Response",
+            "headers": {
+              "x-total-count": {
+                "schema": {
+                  "type": "integer"
+                },
+                "description": "Rows matching every filter except the before cursor: the size of the whole quarantine, however far the page is (issue #192)."
+              }
+            },
+            "content": {
+              "application/json": {
+                "schema": {
+                  "type": "array",
+                  "items": {
+                    "type": "object",
+                    "properties": {
+                      "id": {
+                        "type": "integer"
+                      },
+                      "event_id": {
+                        "type": "string"
+                      },
+                      "contract_id": {
+                        "type": "string",
+                        "nullable": true
+                      },
+                      "symbol": {
+                        "type": "string"
+                      },
+                      "ledger": {
+                        "type": "integer"
+                      },
+                      "created_at": {
+                        "type": "string",
+                        "format": "date-time"
+                      },
+                      "resolved_at": {
+                        "type": "string",
+                        "format": "date-time",
+                        "nullable": true
+                      }
+                    }
+                  }
+                }
+              }
+            }
+          },
+          "400": {
+            "description": "Default Response",
+            "content": {
+              "application/json": {
+                "schema": {
+                  "type": "object",
+                  "properties": {
+                    "error": {
+                      "type": "string"
+                    }
+                  }
+                }
+              }
+            }
+          }
+        }
+      }
+    },
+    "/api/admin/quarantine-state": {
+      "get": {
+        "summary": "Per-contract quarantine escalation state",
+        "tags": [
+          "admin"
+        ],
+        "description": "Read-only operator diagnostic over quarantine_state: consecutive whole-page failure count and escalation timestamp per tailed contract. Unauthenticated, like /admin/failed-events; raw error_message and all exception text are never returned. Use ?contract= to scope to one contract.",
+        "parameters": [
+          {
+            "schema": {
+              "type": "string"
+            },
+            "in": "query",
+            "name": "contract",
+            "required": false,
+            "description": "Only the quarantine state for this contract id."
+          }
+        ],
+        "responses": {
+          "200": {
+            "description": "Default Response",
+            "content": {
+              "application/json": {
+                "schema": {
+                  "type": "array",
+                  "items": {
+                    "type": "object",
+                    "properties": {
+                      "contract_id": {
+                        "type": "string"
+                      },
+                      "failures": {
+                        "type": "integer",
+                        "description": "Current consecutive whole-page failure count."
+                      },
+                      "escalated": {
+                        "type": "boolean",
+                        "description": "True while escalated_at is set."
+                      },
+                      "escalated_at": {
+                        "type": "string",
+                        "format": "date-time",
+                        "nullable": true
+                      }
+                    }
+                  }
+                }
+              }
+            }
+          },
+          "400": {
+            "description": "Default Response",
+            "content": {
+              "application/json": {
+                "schema": {
+                  "type": "object",
+                  "properties": {
+                    "error": {
+                      "type": "string"
+                    }
+                  }
+                }
+              }
+            }
+          }
+        }
+      }
+    },
+    "/api/admin/failed-events/{id}/re-evaluate": {
+      "post": {
+        "parameters": [
+          {
+            "schema": {
+              "type": "string"
+            },
+            "in": "path",
+            "name": "id",
+            "required": true
+          }
+        ],
+        "responses": {
+          "200": {
+            "description": "Default Response"
+          }
+        }
+      }
+    },
+    "/api/admin/failed-events/batch-resolve": {
+      "post": {
+        "responses": {
+          "200": {
+            "description": "Default Response"
+          }
+        }
+      }
+    },
+    "/api/admin/clear-reorg": {
+      "post": {
+        "summary": "Clear reorg halt",
+        "tags": [
+          "admin"
+        ],
+        "description": "Acknowledges a recorded ledger discontinuity without rebuilding. Clears uncleared reorg halts and records the action into admin_audit_log (issue #402).",
+        "responses": {
+          "200": {
+            "description": "Default Response"
+          }
+        }
+      }
+    },
+    "/api/admin/audit-log": {
+      "get": {
+        "responses": {
+          "200": {
+            "description": "Default Response"
+          }
+        }
+      }
+    },
+    "/api/contracts": {
+      "get": {
+        "summary": "Tailed contracts and cursor health",
+        "tags": [
+          "stats"
+        ],
+        "description": "Lists every configured contract (CONTRACT_IDS, or the single CONTRACT_ID) with its last indexed ledger, observed RPC ledger tip, staleness and uncleared reorg halt. Unauthenticated operational diagnostic, consistent with /api/stats and /health. Cursor-write failures are not here: that map is worker-local — see the worker diagnostic listener documented in the README.",
+        "responses": {
+          "200": {
+            "description": "Default Response",
+            "content": {
+              "application/json": {
+                "schema": {
+                  "type": "array",
+                  "items": {
+                    "type": "object",
+                    "properties": {
+                      "contractId": {
+                        "type": "string"
+                      },
+                      "lastIndexedLedger": {
+                        "type": "integer",
+                        "nullable": true
+                      },
+                      "observedTipLedger": {
+                        "type": "integer",
+                        "nullable": true
+                      },
+                      "ledgersBehind": {
+                        "type": "integer",
+                        "nullable": true
+                      },
+                      "secondsSinceUpdate": {
+                        "type": "integer",
+                        "nullable": true
+                      },
+                      "stale": {
+                        "type": "boolean",
+                        "description": "True when the cursor has been idle longer than INDEXER_STALE_AFTER_MS."
+                      },
+                      "status": {
+                        "type": "string",
+                        "enum": [
+                          "cold_start",
+                          "stale",
+                          "ok"
+                        ],
+                        "description": "cold_start means no cursor row yet; stale and ok follow /ready's staleness rule."
+                      },
+                      "reorgDetected": {
+                        "type": "boolean",
+                        "description": "True when an uncleared reorg halt exists for this contract."
+                      }
+                    }
+                  }
+                }
+              }
+            }
+          },
+          "503": {
+            "description": "Default Response",
+            "content": {
+              "application/json": {
+                "schema": {
+                  "type": "object",
+                  "properties": {
+                    "error": {
+                      "type": "string"
+                    }
+                  }
+                }
+              }
+            }
+          }
+        }
+      }
+    },
+    "/api/stats": {
+      "get": {
+        "summary": "DAO statistics",
+        "tags": [
+          "stats"
+        ],
+        "responses": {
+          "200": {
+            "description": "Default Response",
+            "content": {
+              "application/json": {
+                "schema": {
+                  "type": "object",
+                  "properties": {
+                    "totalMembers": {
+                      "type": "integer"
+                    },
+                    "activeMembers": {
+                      "type": "integer"
+                    },
+                    "totalLoanProposals": {
+                      "type": "integer"
+                    },
+                    "totalLoans": {
+                      "type": "integer"
+                    },
+                    "activeLoans": {
+                      "type": "integer"
+                    },
+                    "defaultedLoans": {
+                      "type": "integer"
+                    },
+                    "totalDefaultedValue": {
+                      "type": "string"
+                    },
+                    "totalTreasuryProposals": {
+                      "type": "integer"
+                    },
+                    "totalStaked": {
+                      "type": "string"
+                    },
+                    "totalContribution": {
+                      "type": "string"
+                    },
+                    "stakingRatio": {
+                      "type": "number"
+                    },
+                    "interestCollected": {
+                      "type": "string"
+                    },
+                    "principalLent": {
+                      "type": "string"
+                    },
+                    "principalRepaid": {
+                      "type": "string"
+                    },
+                    "valueDefaulted": {
+                      "type": "string"
+                    },
+                    "quarantinedEvents": {
+                      "type": "integer"
+                    },
+                    "quarantineEscalatedAt": {
+                      "type": "string",
+                      "nullable": true
+                    },
+                    "lastIndexedLedger": {
+                      "type": "integer",
+                      "nullable": true
+                    },
+                    "observedTipLedger": {
+                      "type": "integer",
+                      "nullable": true
+                    },
+                    "ledgersBehind": {
+                      "type": "integer",
+                      "nullable": true
+                    },
+                    "estimatedLagSeconds": {
+                      "type": "integer",
+                      "nullable": true
+                    },
+                    "secondsSinceUpdate": {
+                      "type": "integer",
+                      "nullable": true
+                    },
+                    "indexerStale": {
+                      "type": "boolean"
+                    },
+                    "connectedStreams": {
+                      "type": "integer"
+                    },
+                    "notificationFailures": {
+                      "type": "integer"
+                    },
+                    "reorgDetected": {
+                      "type": "boolean"
+                    },
+                    "contracts": {
+                      "type": "object",
+                      "description": "Per-contract indexer health, present only with multiple CONTRACT_IDS.",
+                      "additionalProperties": {
+                        "type": "object",
+                        "properties": {
+                          "lastIndexedLedger": {
+                            "type": "integer",
+                            "nullable": true
+                          },
+                          "observedTipLedger": {
+                            "type": "integer",
+                            "nullable": true
+                          },
+                          "ledgersBehind": {
+                            "type": "integer",
+                            "nullable": true
+                          },
+                          "quarantinedEvents": {
+                            "type": "integer"
+                          },
+                          "quarantineEscalatedAt": {
+                            "type": "string",
+                            "nullable": true
+                          },
+                          "reorgDetected": {
+                            "type": "boolean"
+                          }
+                        }
+                      }
+                    },
+                    "reorgHalt": {
+                      "type": "object",
+                      "properties": {
+                        "detectedAt": {
+                          "type": "string"
+                        },
+                        "contractId": {
+                          "type": "string"
+                        },
+                        "lastLedger": {
+                          "type": "integer",
+                          "nullable": true
+                        },
+                        "detail": {
+                          "type": "string"
+                        }
+                      },
+                      "nullable": true
+                    }
+                  }
+                }
+              }
+            }
+          },
+          "503": {
+            "description": "Default Response",
+            "content": {
+              "application/json": {
+                "schema": {
+                  "type": "object",
+                  "properties": {
+                    "error": {
+                      "type": "string"
+                    }
+                  }
+                }
+              }
+            }
+          }
+        }
+      }
+    },
+    "/api/stats/history": {
+      "get": {
+        "summary": "Historical daily loan aggregates",
+        "tags": [
+          "stats"
+        ],
+        "responses": {
+          "200": {
+            "description": "Default Response",
+            "content": {
+              "application/json": {
+                "schema": {
+                  "type": "object",
+                  "required": [
+                    "data"
+                  ],
+                  "properties": {
+                    "data": {
+                      "type": "array",
+                      "items": {
+                        "type": "object",
+                        "required": [
+                          "date",
+                          "principalLent",
+                          "principalRepaid",
+                          "defaults",
+                          "valueDefaulted",
+                          "cumulativeDefaultRatePercent"
+                        ],
+                        "properties": {
+                          "date": {
+                            "type": "string",
+                            "format": "date"
+                          },
+                          "principalLent": {
+                            "type": "string"
+                          },
+                          "principalRepaid": {
+                            "type": "string"
+                          },
+                          "defaults": {
+                            "type": "integer"
+                          },
+                          "valueDefaulted": {
+                            "type": "string"
+                          },
+                          "cumulativeDefaultRatePercent": {
+                            "type": "number"
+                          }
+                        }
+                      }
+                    }
+                  }
+                }
+              }
+            }
+          }
+        }
+      }
+    },
+    "/health": {
+      "get": {
+        "summary": "Liveness probe",
+        "tags": [
+          "health"
+        ],
+        "description": "Always 200 if the process is up — deliberately does no database round trip. Use /ready to check database and indexer freshness.",
+        "responses": {
+          "200": {
+            "description": "Default Response",
+            "content": {
+              "application/json": {
+                "schema": {
+                  "type": "object",
+                  "properties": {
+                    "status": {
+                      "type": "string",
+                      "enum": [
+                        "ok"
+                      ]
+                    },
+                    "contract": {
+                      "type": "string",
+                      "description": "Currently configured Soroban contract id, or null if unset.",
+                      "nullable": true
+                    },
+                    "auth": {
+                      "type": "object",
+                      "properties": {
+                        "challengesIssued": {
+                          "type": "integer"
+                        },
+                        "verificationsSucceeded": {
+                          "type": "integer"
+                        },
+                        "verificationsFailed": {
+                          "type": "object",
+                          "properties": {
+                            "missingHeaders": {
+                              "type": "integer"
+                            },
+                            "invalidNonce": {
+                              "type": "integer"
+                            },
+                            "invalidSignature": {
+                              "type": "integer"
+                            },
+                            "addressMismatch": {
+                              "type": "integer"
+                            },
+                            "malformedEncoding": {
+                              "type": "integer"
+                            },
+                            "unsupportedAddressType": {
+                              "type": "integer"
+                            }
+                          }
+                        }
+                      }
+                    }
+                  }
+                }
+              }
+            }
+          }
+        }
+      }
+    },
+    "/health/dependencies": {
+      "get": {
+        "summary": "Per-dependency health indicators",
+        "tags": [
+          "health"
+        ],
+        "description": "Always 200 — a degraded dependency is reported in its own status field, not the HTTP status code. For dashboards/alerting; use /ready for the orchestrator pass/fail probe.",
+        "responses": {
+          "200": {
+            "description": "Default Response",
+            "content": {
+              "application/json": {
+                "schema": {
+                  "type": "object",
+                  "properties": {
+                    "postgres": {
+                      "type": "object",
+                      "properties": {
+                        "status": {
+                          "type": "string",
+                          "enum": [
+                            "ok",
+                            "degraded",
+                            "error"
+                          ]
+                        },
+                        "latencyMs": {
+                          "type": "integer"
+                        },
+                        "error": {
+                          "type": "string",
+                          "description": "Present only when status is \"error\"."
+                        }
+                      }
+                    },
+                    "rpc": {
+                      "type": "object",
+                      "properties": {
+                        "status": {
+                          "type": "string",
+                          "enum": [
+                            "ok",
+                            "degraded",
+                            "error"
+                          ]
+                        },
+                        "latencyMs": {
+                          "type": "integer"
+                        },
+                        "error": {
+                          "type": "string",
+                          "description": "Present only when status is \"error\"."
+                        }
+                      }
+                    }
+                  }
+                }
+              }
+            }
+          }
+        }
+      }
+    },
+    "/version": {
+      "get": {
+        "summary": "Build metadata",
+        "tags": [
+          "health"
+        ],
+        "responses": {
+          "200": {
+            "description": "Default Response",
+            "content": {
+              "application/json": {
+                "schema": {
+                  "type": "object",
+                  "properties": {
+                    "version": {
+                      "type": "string",
+                      "description": "package.json's version, or 'unknown' if it couldn't be read."
+                    },
+                    "commit": {
+                      "type": "string",
+                      "description": "SOURCE_COMMIT env var, or 'unknown' if unset."
+                    },
+                    "buildDate": {
+                      "type": "string",
+                      "description": "BUILD_DATE env var, or 'unknown' if unset."
+                    }
+                  }
+                }
+              }
+            }
+          }
+        }
+      }
+    },
+    "/metrics": {
+      "get": {
+        "summary": "Prometheus scrape endpoint",
+        "tags": [
+          "stats"
+        ],
+        "description": "Prometheus exposition format (text/plain). Exposes ourdao_sse_connections (gauge: currently open SSE connections), ourdao_sse_connections_total (counter: SSE connections opened, ever), ourdao_sse_messages_total (counter: SSE messages written, labeled by event_type), plus Node.js default process/runtime metrics from prom-client.",
+        "responses": {
+          "200": {
+            "description": "Default Response",
+            "content": {
+              "text/plain": {
+                "schema": {
+                  "type": "string"
+                }
+              }
+            }
+          }
+        }
+      }
+    },
+    "/ready": {
+      "get": {
+        "summary": "Readiness probe",
+        "tags": [
+          "health"
+        ],
+        "description": "Checks Postgres reachability and indexer freshness. 200 means ready (indexer 'cold_start' on an empty database is still 200 — see acceptance criteria). 503 covers every not-ready reason: postgres_timeout, postgres_unreachable, postgres_error, reorg_detected, indexer_stale.",
+        "responses": {
+          "200": {
+            "description": "Default Response",
+            "content": {
+              "application/json": {
+                "schema": {
+                  "type": "object",
+                  "properties": {
+                    "status": {
+                      "type": "string",
+                      "enum": [
+                        "ready"
+                      ]
+                    },
+                    "indexer": {
+                      "type": "string",
+                      "enum": [
+                        "cold_start",
+                        "ok"
+                      ]
+                    },
+                    "lastIndexedLedger": {
+                      "type": "integer",
+                      "nullable": true
+                    },
+                    "observedTipLedger": {
+                      "type": "integer",
+                      "nullable": true
+                    },
+                    "ledgersBehind": {
+                      "type": "integer",
+                      "nullable": true
+                    },
+                    "estimatedLagSeconds": {
+                      "type": "integer",
+                      "nullable": true
+                    },
+                    "secondsSinceUpdate": {
+                      "type": "integer",
+                      "nullable": true
+                    }
+                  }
+                }
+              }
+            }
+          },
+          "503": {
+            "description": "Default Response",
+            "content": {
+              "application/json": {
+                "schema": {
+                  "type": "object",
+                  "properties": {
+                    "status": {
+                      "type": "string",
+                      "enum": [
+                        "not ready"
+                      ]
+                    },
+                    "reason": {
+                      "type": "string",
+                      "enum": [
+                        "postgres_timeout",
+                        "postgres_unreachable",
+                        "postgres_error",
+                        "reorg_detected",
+                        "indexer_stale"
+                      ]
+                    },
+                    "reorg": {
+                      "type": "object",
+                      "description": "Present only when reason is reorg_detected.",
+                      "properties": {
+                        "detectedAt": {
+                          "type": "string"
+                        },
+                        "contractId": {
+                          "type": "string"
+                        },
+                        "lastLedger": {
+                          "type": "integer",
+                          "nullable": true
+                        },
+                        "detail": {
+                          "type": "string"
+                        }
+                      }
+                    },
+                    "lastIndexedLedger": {
+                      "type": "integer",
+                      "description": "Present when reason is reorg_detected or indexer_stale.",
+                      "nullable": true
+                    },
+                    "observedTipLedger": {
+                      "type": "integer",
+                      "description": "Present when reason is reorg_detected or indexer_stale.",
+                      "nullable": true
+                    },
+                    "ledgersBehind": {
+                      "type": "integer",
+                      "description": "Present only when reason is indexer_stale.",
+                      "nullable": true
+                    },
+                    "estimatedLagSeconds": {
+                      "type": "integer",
+                      "description": "Present only when reason is indexer_stale.",
+                      "nullable": true
+                    },
+                    "secondsSinceUpdate": {
+                      "type": "integer",
+                      "description": "Present only when reason is indexer_stale."
+                    },
+                    "staleAfterMs": {
+                      "type": "integer",
+                      "description": "Present only when reason is indexer_stale."
+                    }
+                  }
+                }
+              }
+            }
+          }
+        }
+      }
+    }
+  },
+  "servers": [
+    {
+      "url": "http://localhost:4000",
+      "description": "Development server"
+    }
+  ],
+  "tags": [
+    {
+      "name": "health",
+      "description": "Service health and readiness endpoints"
+    },
+    {
+      "name": "stats",
+      "description": "Aggregate statistics"
+    },
+    {
+      "name": "members",
+      "description": "DAO member operations"
+    },
+    {
+      "name": "loans",
+      "description": "Loan and loan proposal operations"
+    },
+    {
+      "name": "treasury",
+      "description": "Treasury proposal operations"
+    },
+    {
+      "name": "notifications",
+      "description": "Member notifications"
+    },
+    {
+      "name": "events",
+      "description": "Raw event feed"
+    },
+    {
+      "name": "admin",
+      "description": "Admin and governance operations"
+    },
+    {
+      "name": "auth",
+      "description": "Authentication operations"
+    },
+    {
+      "name": "documents",
+      "description": "Proposal document attachments"
+    },
+    {
+      "name": "interest",
+      "description": "Interest distribution history"
+    }
+  ]
+}

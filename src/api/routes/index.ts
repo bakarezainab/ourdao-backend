@@ -1,36 +1,41 @@
 import type { FastifyInstance } from 'fastify'
 import { StrKey } from '@stellar/stellar-sdk'
-import { query, queryOne } from '../../db/index.js'
+import { query, queryOne, withTransaction } from '../../db/index.js'
 import { config } from '../../config.js'
 import {
   ADMIN_EVENT_SYMBOLS,
+  EVENT_FIELDS,
   LOAN_TIMELINE_SYMBOLS,
   TREASURY_TIMELINE_SYMBOLS,
   MEMBER_ACTIVITY_SYMBOLS,
+  isKnownSymbol,
   namedFields,
 } from '../../stellar/events.js'
-import type {
-  DAOStats,
-  LoanProposalRow,
-  LoanRow,
-  MemberRow,
-  MemberSummary,
-  NotificationRow,
-  TreasuryProposalRow,
-  EventRow,
-  InterestDistributionRow,
-  DocumentRow,
-  FailedEventRow,
-  TimelineEntry,
+import {
+  LOAN_PROPOSAL_STATUSES,
+  LOAN_STATUSES,
+  TREASURY_PROPOSAL_STATUSES,
+  type DAOStats,
+  type LoanProposalRow,
+  type LoanRow,
+  type MemberRow,
+  type MemberSummary,
+  type NotificationRow,
+  type TreasuryProposalRow,
+  type EventRow,
+  type InterestDistributionRow,
+  type DocumentRow,
+  type FailedEventRow,
+  type TimelineEntry,
+  type AdminAuditLogRow,
+  type AdminAuditAction,
 } from '../../types.js'
 import { authenticateRequest, isValidStellarAddress, type NonceStore } from '../../auth.js'
 import { getTracer, requestSpan, type Span } from '../../telemetry.js'
 
 // Small helper: clamp a `limit` query param to a sane range.
 function limit(v: unknown, def = 50, max = 200): number {
-  const n = Number.parseInt(String(v ?? ''), 10)
-  if (!Number.isFinite(n) || n <= 0) return def
-  return Math.min(n, max)
+  return parseLimit(v, def, max) ?? def
 }
 
 // Parse an optional numeric pagination cursor (e.g. `?before=`). Returns null
@@ -62,8 +67,63 @@ function invalidEventCursor(v: unknown): boolean {
   return v !== undefined && eventCursor(v) === null
 }
 
+// Issue #278: `?from_ledger=`/`?to_ledger=` on /events. Parses a single bound
+// to a non-negative integer, or null if absent/malformed (mirrors `cursor`
+// above). Ledger 0 is a legitimate lower bound (the genesis ledger), unlike
+// the `cursor`/`limit` helpers above where 0 means "absent" — so this can't
+// reuse those.
+function ledgerBound(v: unknown): number | null {
+  if (v === undefined || v === null || v === '') return null
+  const raw = String(v).trim()
+  if (!/^[0-9]+$/.test(raw)) return null
+  const n = Number(raw)
+  return Number.isSafeInteger(n) && n >= 0 ? n : null
+}
+
+// Issue #278: max span a single from_ledger/to_ledger query may cover — wide
+// enough for any realistic dashboard range query, and small enough that a
+// full-range scan can't be used to force an unbounded sequential scan.
+const MAX_LEDGER_RANGE = 10_000
+
+// Validates `from_ledger`/`to_ledger` together: each must be a well-formed
+// non-negative integer when present, `from_ledger <= to_ledger` when both are
+// given, and the span between them must not exceed MAX_LEDGER_RANGE. A
+// single bound (only `from_ledger` or only `to_ledger`) has no span to check.
+function invalidLedgerRange(fromRaw: unknown, toRaw: unknown): boolean {
+  if (fromRaw !== undefined && ledgerBound(fromRaw) === null) return true
+  if (toRaw !== undefined && ledgerBound(toRaw) === null) return true
+  const from = ledgerBound(fromRaw)
+  const to = ledgerBound(toRaw)
+  if (from !== null && to !== null) {
+    if (from > to) return true
+    if (to - from > MAX_LEDGER_RANGE) return true
+  }
+  return false
+}
+
 function validAddress(address: string): boolean {
   return StrKey.isValidEd25519PublicKey(address)
+}
+
+function isMemberActivitySymbol(v: unknown): v is (typeof MEMBER_ACTIVITY_SYMBOLS)[number] {
+  return typeof v === 'string' && (MEMBER_ACTIVITY_SYMBOLS as readonly string[]).includes(v)
+}
+
+function isAdminEventSymbol(v: unknown): v is (typeof ADMIN_EVENT_SYMBOLS)[number] {
+  return typeof v === 'string' && (ADMIN_EVENT_SYMBOLS as readonly string[]).includes(v)
+}
+
+function parseOrder(v: unknown): 'asc' | 'desc' | null {
+  if (v === undefined || v === null || v === '') return 'desc'
+  if (typeof v === 'string') {
+    const lower = v.toLowerCase()
+    if (lower === 'asc' || lower === 'desc') return lower
+  }
+  return null
+}
+
+function invalidOrder(v: unknown): boolean {
+  return v !== undefined && v !== null && v !== '' && parseOrder(v) === null
 }
 
 // Validate a positive integer path param (loan / proposal id). Returns the
@@ -73,6 +133,18 @@ function entityIdParam(v: string): string | null {
   const raw = v.trim()
   if (!/^[0-9]+$/.test(raw) || !Number.isSafeInteger(Number(raw)) || Number(raw) <= 0) return null
   return raw
+}
+
+// Optional `?contract=` filter shared by the operator diagnostics that expose
+// per-contract state. Contract ids are opaque strings here (the indexer treats
+// them as such too), so validation only rejects blank/oversized values rather
+// than inventing a stricter format than the rest of the API accepts.
+function contractFilter(v: unknown): string | null | undefined {
+  if (v === undefined || v === null || v === '') return null
+  if (typeof v !== 'string') return undefined
+  const trimmed = v.trim()
+  if (!trimmed || trimmed.length > 256) return undefined
+  return trimmed
 }
 
 // Decode one raw `events` row into a timeline entry (issue #26): named fields
@@ -97,40 +169,188 @@ function toTimelineEntry(row: EventRow): TimelineEntry {
 // DAO's per-proposal event count; a client that hits it can page /api/events.
 const TIMELINE_MAX_ROWS = 2000
 
+// Issue #586: shared response schema for both timeline endpoints — `truncated`
+// (and `total`, the full matching-row count) let a client tell "capped at
+// TIMELINE_MAX_ROWS" apart from "this is everything", the way
+// loans_truncated/loans_total_count already do for the member-summary embed
+// (issue #165). Additive to the existing `{ timeline: [...] }` shape per
+// docs/API_COMPATIBILITY.md, so existing clients that ignore unrecognized
+// fields are unaffected.
+const timelineResponseSchema = {
+  type: 'object',
+  properties: {
+    timeline: {
+      type: 'array',
+      items: {
+        type: 'object',
+        properties: {
+          id: { type: 'string' },
+          symbol: { type: 'string' },
+          ledger: { type: 'integer' },
+          timestamp: { type: 'string' },
+          tx_hash: { type: 'string', nullable: true },
+          // additionalProperties: true — fast-json-stringify otherwise
+          // serializes an object schema with no declared keys as `{}`,
+          // which would silently drop every decoded field (issue #26's
+          // whole point: `fields.amount` instead of the raw data tuple).
+          fields: { type: 'object', additionalProperties: true },
+        },
+      },
+    },
+    truncated: { type: 'boolean', description: `true when more than ${TIMELINE_MAX_ROWS} rows matched and the response was capped.` },
+    total: { type: 'integer', description: 'Total matching rows, independent of the cap.' },
+  },
+} as const
+
 // Shared implementation for the two per-entity timeline endpoints. `symbols`
 // is the lifecycle set for the entity family; the id is matched against the
 // first `data` tuple entry (`data->>0`), which every symbol in these sets
 // carries — see LOAN_TIMELINE_SYMBOLS / TREASURY_TIMELINE_SYMBOLS.
-async function entityTimeline(symbols: readonly string[], id: string): Promise<TimelineEntry[]> {
-  const rows = await query<EventRow>(
-    `SELECT * FROM events
+//
+// Issue #586: `total_count` is a window-function count over every matching
+// row (computed before the `LIMIT`, unlike a plain COUNT(*) would need a
+// second query), so `truncated`/`total` come from this one query rather than
+// an extra round trip — matching how GET /api/members/:address/summary's
+// `loans_truncated`/`loans_total_count` (issue #165) make an analogous cap
+// visible instead of silent.
+async function entityTimeline(symbols: readonly string[], id: string): Promise<{ timeline: TimelineEntry[]; truncated: boolean; total: number }> {
+  const rows = await query<EventRow & { total_count: string }>(
+    `SELECT *, COUNT(*) OVER() AS total_count FROM events
        WHERE symbol = ANY($1) AND data->>0 = $2
        ORDER BY ledger ASC, id ASC
        LIMIT $3`,
     [symbols as string[], id, TIMELINE_MAX_ROWS]
   )
-  return rows.map(toTimelineEntry)
-}
-
-// A loan's interest charge and repayment progress aren't stored columns —
-// both derive from total_repayment, which issue #11 added — so compute them
-// at read time rather than duplicating state that could drift out of sync.
-// BigInt (not Number) because these are NUMERIC(40,0) decimal strings that
-// can exceed Number.MAX_SAFE_INTEGER.
-function withLoanDerived(loan: LoanRow): LoanRow & { interest_charge: string; repaid_amount: string } {
-  const totalRepayment = BigInt(loan.total_repayment)
-  const amount = BigInt(loan.amount)
-  const outstanding = BigInt(loan.outstanding)
+  const total = rows.length > 0 ? Number(rows[0]!.total_count) : 0
   return {
-    ...loan,
-    interest_charge: (totalRepayment - amount).toString(),
-    repaid_amount: (totalRepayment - outstanding).toString(),
+    timeline: rows.map(toTimelineEntry),
+    truncated: total > TIMELINE_MAX_ROWS,
+    total,
   }
 }
 
-export async function registerRoutes(app: FastifyInstance, opts: { nonceStore: NonceStore }): Promise<void> {
-  const { nonceStore } = opts
-  
+// Issue #277: pulled out of the route handler so it can be called from
+// inside `getOrSetCache`'s fetcher without the handler itself growing an
+// inline template-literal SQL block wrapped in another closure. Behavior is
+// unchanged from before this issue — same CTEs, same shape, `null` when the
+// address has no member row.
+async function fetchMemberSummary(address: string): Promise<MemberSummary | null> {
+  const row = await queryOne<{ summary: MemberSummary }>(`
+    WITH m AS (
+      SELECT * FROM members WHERE address = $1
+    ),
+    totals AS (
+      -- Issue #164: both denominators must match the contract's own
+      -- definition of a member's claim. calculate_exit_share() in
+      -- ourdao-contracts (contracts/dao/src/membership.rs) computes
+      -- treasury * contribution / total_active_contributions, where
+      -- total_active_contributions sums 'contribution' only over members
+      -- with MemberStatus::ActiveMember — the same exited = false this
+      -- table already (correctly) uses for total_stake, and for
+      -- active_members/total_staked in /api/stats. contribution_share_bps
+      -- is therefore a member's share of *currently active* contribution,
+      -- matching what the contract would actually pay on exit, not a
+      -- share of every contribution ever made including exited members'.
+      SELECT
+        (SELECT COALESCE(SUM(contribution), 0) FROM members WHERE exited = false) as total_contribution,
+        (SELECT COALESCE(SUM(stake), 0) FROM members WHERE exited = false) as total_stake
+    ),
+    unread_notifs AS (
+      SELECT COUNT(*) as unread_count FROM notifications WHERE address = $1 AND read = false
+    ),
+    -- Issue #165: aggregates run over the member's *entire* loan history —
+    -- independent of ${LOANS_EMBED_LIMIT}, the cap on the embedded list
+    -- below — so a long-tenured member's repaid/defaulted counts and
+    -- defaulted value are never silently wrong just because they have
+    -- more than ${LOANS_EMBED_LIMIT} loans.
+    member_loans_agg AS (
+      SELECT COUNT(*) as total_count,
+             COUNT(*) FILTER (WHERE status = 'repaid') as repaid_loans_count,
+             COUNT(*) FILTER (WHERE status = 'defaulted') as defaulted_loans_count,
+             COALESCE(SUM(outstanding) FILTER (WHERE status = 'defaulted'), 0) as defaulted_loans_value
+      FROM loans WHERE borrower = $1
+    ),
+    -- The embedded list itself stays capped at ${LOANS_EMBED_LIMIT} (full
+    -- history is available, paginated, from GET /api/loans?borrower=) but
+    -- now with an explicit column list instead of SELECT *, and the
+    -- truncation is now visible via loans_total_count/loans_truncated
+    -- below rather than silent.
+    member_loans_embed AS (
+      SELECT COALESCE(json_agg(row_to_json(l)), '[]'::json) as loans
+      FROM (
+        SELECT id, borrower, amount, outstanding, total_repayment, status,
+               approved_ledger, due_time, repaid_ledger, defaulted_ledger, updated_at
+        FROM loans WHERE borrower = $1 ORDER BY id DESC LIMIT ${LOANS_EMBED_LIMIT}
+      ) l
+    )
+    SELECT
+      json_build_object(
+        'member', row_to_json(m.*),
+        'loans', (SELECT loans FROM member_loans_embed),
+        'loans_total_count', (SELECT total_count::int FROM member_loans_agg),
+        'loans_truncated', (SELECT total_count > ${LOANS_EMBED_LIMIT} FROM member_loans_agg),
+        'unread_notifications', (SELECT unread_count::int FROM unread_notifs),
+        'position', json_build_object(
+          'contribution_share_bps', CASE
+            WHEN (SELECT total_contribution FROM totals) > 0 AND m.exited = false
+            THEN TRUNC((m.contribution * 10000) / (SELECT total_contribution FROM totals))::text
+            ELSE '0'
+          END,
+          'stake_share_bps', CASE
+            WHEN (SELECT total_stake FROM totals) > 0 AND m.exited = false
+            THEN TRUNC((m.stake * 10000) / (SELECT total_stake FROM totals))::text
+            ELSE '0'
+          END,
+          'repaid_loans_count', COALESCE((SELECT repaid_loans_count::int FROM member_loans_agg), 0),
+          'defaulted_loans_count', COALESCE((SELECT defaulted_loans_count::int FROM member_loans_agg), 0),
+          'defaulted_loans_value', COALESCE((SELECT defaulted_loans_value FROM member_loans_agg), 0)::text
+        )
+      ) as summary
+    FROM m
+  `, [address])
+
+  return row?.summary ?? null
+}
+
+// Issue #291: write one row to admin_audit_log for every authenticated admin
+// action. Called fire-and-forget — a logging failure must never block the
+// action itself; errors are logged via the request logger so they appear in
+// the operator's log stream with the same correlation id as the action.
+//
+// `ip` is the request IP (req.ip in Fastify, which respects TRUST_PROXY); it
+// is stored as-is — trust level depends on how the server is deployed.
+// `payload` is an action-specific object (event id, ledger, etc.) that gives
+// an auditor enough context to reconstruct what changed.
+async function writeAuditLog(
+  adminAddress: string,
+  action: AdminAuditAction | string,
+  ip: string | null,
+  payload: Record<string, unknown>,
+  log: { error(obj: unknown, msg: string): void }
+): Promise<void> {
+  try {
+    await query(
+      `INSERT INTO admin_audit_log (admin_address, action, ip_address, payload)
+       VALUES ($1, $2, $3, $4)`,
+      [adminAddress, action, ip ?? null, JSON.stringify(payload)]
+    )
+  } catch (err) {
+    // Never let a logging failure surface to the caller — log it and move on.
+    log.error({ err }, `[audit] failed to write audit log entry action=${action}`)
+  }
+}
+
+export async function registerRoutes(app: FastifyInstance, opts: { nonceStore: NonceStore; authFailureTracker?: AuthFailureTracker }): Promise<void> {
+  const { nonceStore, authFailureTracker } = opts
+  const historyCache = createHistoryCache()
+  app.addHook('onClose', async () => historyCache.close())
+
+  // --- SSE stream (issues #63, #158) ---
+  // Registered inside the `/api` plugin so it inherits the prefix and any
+  // future plugin-scoped hooks. See registerStreamEndpoint for the rate-limit
+  // decision (handshake stays rate-limited; open connections use STREAM_MAX_*).
+  await registerStreamEndpoint(app)
+
   // --- Authentication challenge (issue #65) ---
   // Stricter rate limit on this endpoint to prevent DoS attacks
   app.get<{ Querystring: { address: string } }>('/auth/challenge', {
@@ -145,44 +365,52 @@ export async function registerRoutes(app: FastifyInstance, opts: { nonceStore: N
     if (!address) {
       return reply.code(400).send({ error: 'address query param is required' })
     }
-    
-    // Validate address is a well-formed Stellar public key (issue #65)
-    if (!isValidStellarAddress(address)) {
+
+    // Validate address is a well-formed Stellar address (issue #65). Accept
+    // both families verifySignature can resolve — ed25519 and muxed (issue
+    // #116) — and reject contract (C…) and anything malformed.
+    const addressType = classifyStellarAddress(address)
+    if (addressType !== 'ed25519' && addressType !== 'muxed') {
       return reply.code(400).send({ error: 'invalid Stellar address' })
     }
     
-    // Bound the request: reject over-long address (issue #65)
-    const MAX_ADDRESS_LENGTH = 56 // Stellar public keys are 56 characters
-    if (address.length > MAX_ADDRESS_LENGTH) {
-      return reply.code(400).send({ error: 'address too long' })
-    }
+
     
     try {
-      const nonce = await nonceStore.issue(address)
+      const nonce = await nonceStore.issue(address, req.log)
       return { nonce }
     } catch {
       // Nonce store capacity exceeded
       return reply.code(503).send({ error: 'Service temporarily unavailable' })
     }
   })
-  
+
   // --- Members ---
   // `joined_ledger IS NOT NULL` filters out phantom rows — an address that
   // only ever appeared in a `name_reg`/`staked` event and never actually
   // joined the DAO (issue #14). A real member always has a join ledger.
   app.get('/members', async (req, reply) => {
-    reply.header('Cache-Control', 'public, max-age=5, must-revalidate')
-    const l = limit((req.query as Record<string, unknown>).limit)
-    return query<MemberRow>(
-      `SELECT * FROM members
-        WHERE exited = false AND joined_ledger IS NOT NULL
-        ORDER BY joined_ledger DESC NULLS LAST LIMIT $1`,
-      [l]
+    setCachePolicy(reply, 'public-live')
+    const q = req.query as Record<string, unknown>
+    if (invalidLimit(q.limit)) return reply.code(400).send({ error: 'invalid limit parameter' })
+    const l = limit(q.limit)
+    // Issue #277: this ordered member listing is the closest thing this
+    // codebase has to a "leaderboard" and, like /members/:address/summary
+    // below, is heavy enough (full table scan + sort) to be worth a
+    // short-lived read-through cache. Falls straight through to Postgres
+    // when REDIS_URL isn't configured — see src/cache/redis.ts.
+    return getOrSetCache(membersListCacheKey(l), config.cache.memberCacheTtlSeconds, () =>
+      query<MemberRow>(
+        `SELECT * FROM members
+          WHERE exited = false AND joined_ledger IS NOT NULL
+          ORDER BY joined_ledger DESC NULLS LAST LIMIT $1`,
+        [l]
+      )
     )
   })
 
   app.get<{ Params: { address: string } }>('/members/:address', async (req, reply) => {
-    reply.header('Cache-Control', 'public, max-age=5, must-revalidate')
+    setCachePolicy(reply, 'public-live')
     if (!validAddress(req.params.address)) {
       return reply.code(400).send({ error: 'invalid Stellar address' })
     }
@@ -192,7 +420,7 @@ export async function registerRoutes(app: FastifyInstance, opts: { nonceStore: N
   })
 
   app.get<{ Params: { address: string } }>('/members/:address/summary', async (req, reply) => {
-    reply.header('Cache-Control', 'private, no-cache')
+    setCachePolicy(reply, 'private')
     if (!validAddress(req.params.address)) {
       return reply.code(400).send({ error: 'invalid Stellar address' })
     }
@@ -256,6 +484,7 @@ export async function registerRoutes(app: FastifyInstance, opts: { nonceStore: N
       result.loans = result.loans.map(withLoanDerived)
     }
 
+    if (!result) return reply.code(404).send({ error: 'member not found' })
     return result
   })
 
@@ -267,18 +496,62 @@ export async function registerRoutes(app: FastifyInstance, opts: { nonceStore: N
   // restricts to MEMBER_ACTIVITY_SYMBOLS so an address that only appears as
   // e.g. a treasury `destination` doesn't show up here. `?before=<ledger>`
   // cursor, like the other historical feeds.
-  app.get<{ Params: { address: string } }>('/members/:address/activity', async (req, reply) => {
-    reply.header('Cache-Control', 'public, max-age=5, must-revalidate')
-    if (!validAddress(req.params.address)) {
+  app.get<{ Params: { address: string } }>('/members/:address/activity', {
+    schema: {
+      tags: ['members'],
+      summary: "A member's cross-entity activity feed",
+      querystring: {
+        type: 'object',
+        properties: {
+          limit: { type: 'string', description: 'Max rows to return (1-200, default 50).' },
+          before: { type: 'string', description: 'Pagination cursor: return rows from ledgers strictly below this value.' },
+          symbol: {
+            type: 'string',
+            enum: [...MEMBER_ACTIVITY_SYMBOLS],
+            description: 'Narrow the feed to one activity kind (issue #193). Must be one of the member-activity symbols; anything else is a 400.',
+          },
+        },
+      },
+    },
+  }, async (req, reply) => {
+    setCachePolicy(reply, 'public-live')
+    // Issue #263: normalize address to uppercase before validation and query.
+    // Stellar addresses are case-insensitive but Postgres stores the canonical
+    // uppercase form, so mixed-case lookups would return zero results.
+    const rawAddress = req.params.address
+    const address = rawAddress.toUpperCase()
+
+    if (!validAddress(address)) {
       return reply.code(400).send({ error: 'invalid Stellar address' })
     }
     const q = req.query as Record<string, unknown>
+    if (invalidLimit(q.limit)) return reply.code(400).send({ error: 'invalid limit parameter' })
     const l = limit(q.limit)
     const before = cursor(q.before)
     if (invalidCursor(q.before)) return reply.code(400).send({ error: 'invalid before cursor' })
 
-    const params: unknown[] = [MEMBER_ACTIVITY_SYMBOLS as unknown as string[], req.params.address]
-    let where = `WHERE symbol = ANY($1) AND data @> to_jsonb($2::text)`
+    // Issue #193: `?symbol=` narrows the feed to one activity kind. A symbol
+    // outside MEMBER_ACTIVITY_SYMBOLS is rejected explicitly — the unfiltered
+    // query could never have returned it, so a silently empty page would
+    // only hide a client typo.
+    const symbolFilter = q.symbol
+    if (symbolFilter !== undefined && !isMemberActivitySymbol(symbolFilter)) {
+      return reply.code(400).send({
+        error: `invalid symbol filter: expected one of ${MEMBER_ACTIVITY_SYMBOLS.join(', ')}`,
+      })
+    }
+
+    // With a symbol the predicate is an equality on the btree-indexed column
+    // plus the GIN containment; without one it stays `= ANY(...)` over the
+    // whole activity set. Plans for both shapes are recorded in
+    // docs/member-activity-query-plan.md.
+    const params: unknown[] = [
+      symbolFilter ?? (MEMBER_ACTIVITY_SYMBOLS as unknown as string[]),
+      address,
+    ]
+    let where = symbolFilter !== undefined
+      ? `WHERE symbol = $1 AND data @> to_jsonb($2::text)`
+      : `WHERE symbol = ANY($1) AND data @> to_jsonb($2::text)`
     if (before !== null) {
       params.push(before)
       where += ` AND ledger < $${params.length}`
@@ -291,21 +564,68 @@ export async function registerRoutes(app: FastifyInstance, opts: { nonceStore: N
     return { activity: rows.map(toTimelineEntry) }
   })
 
-  // --- Loan proposals ---
-  app.get('/proposals/loan', async (req, reply) => {
-    reply.header('Cache-Control', 'public, max-age=5, must-revalidate')
-    const l = limit((req.query as Record<string, unknown>).limit)
-    return query<LoanProposalRow>('SELECT * FROM loan_proposals ORDER BY id DESC LIMIT $1', [l])
-  })
-
-  // --- Loans (optional ?borrower= filter, ?before=<id> cursor) ---
-  app.get('/loans', async (req, reply) => {
-    reply.header('Cache-Control', 'public, max-age=5, must-revalidate')
+  // --- Loan proposals (optional ?status=, ?borrower=, ?order=, ?before=, ?after= filters) ---
+  app.get('/proposals/loan', {
+    schema: {
+      querystring: {
+        type: 'object',
+        properties: {
+          status: {
+            type: 'string',
+            enum: [...LOAN_PROPOSAL_STATUSES],
+            description: 'Filter by loan proposal status (issue #593). Must be one of LOAN_PROPOSAL_STATUSES; anything else is a 400.',
+          },
+          order: {
+            type: 'string',
+            enum: ['asc', 'desc'],
+            default: 'desc',
+            description: 'Sort ordering by proposal id (asc or desc, default desc) (issue #508).',
+          },
+          before: {
+            type: 'string',
+            description: 'Pagination cursor for descending ordering: return rows with id strictly less than this value (issue #508).',
+          },
+          after: {
+            type: 'string',
+            description: 'Pagination cursor for ascending ordering: return rows with id strictly greater than this value (issue #508).',
+          },
+          limit: {
+            type: 'string',
+            description: 'Max rows to return (1-200, default 50).',
+          },
+        },
+      },
+    },
+  }, async (req, reply) => {
     const q = req.query as Record<string, unknown>
+    if (invalidLimit(q.limit)) return reply.code(400).send({ error: 'invalid limit parameter' })
     const l = limit(q.limit)
     const before = cursor(q.before)
+    const after = cursor(q.after)
     if (invalidCursor(q.before)) return reply.code(400).send({ error: 'invalid before cursor' })
+    if (invalidCursor(q.after)) return reply.code(400).send({ error: 'invalid after cursor' })
+    if (before !== null && after !== null) return reply.code(400).send({ error: 'cannot use before and after together' })
+    if (invalidOrder(q.order)) return reply.code(400).send({ error: 'invalid order parameter: expected asc or desc' })
+    const order = parseOrder(q.order) === 'asc' ? 'ASC' : 'DESC'
+
+    setCachePolicy(reply, historicalOrLive(before !== null || after !== null))
+
+    if (q.borrower !== undefined && q.borrower !== null && q.borrower !== '') {
+      if (typeof q.borrower !== 'string' || !validAddress(q.borrower)) {
+        return reply.code(400).send({ error: 'invalid Stellar address' })
+      }
+    }
     const borrower = typeof q.borrower === 'string' && q.borrower ? q.borrower : null
+
+    // Issue #593: an unrecognized ?status= is rejected explicitly, matching
+    // /api/loans's existing status validation — a typo'd status would
+    // otherwise silently return an empty page instead of a 400.
+    if (q.status !== undefined && q.status !== null && q.status !== '') {
+      if (typeof q.status !== 'string' || !(LOAN_PROPOSAL_STATUSES as readonly string[]).includes(q.status)) {
+        return reply.code(400).send({ error: `invalid status parameter: expected one of ${LOAN_PROPOSAL_STATUSES.join(', ')}` })
+      }
+    }
+    const status = typeof q.status === 'string' && q.status ? q.status : null
 
     const conditions: string[] = []
     const params: unknown[] = []
@@ -313,25 +633,143 @@ export async function registerRoutes(app: FastifyInstance, opts: { nonceStore: N
       params.push(borrower)
       conditions.push(`borrower = $${params.length}`)
     }
+    if (status) {
+      params.push(status)
+      conditions.push(`status = $${params.length}`)
+    }
     if (before !== null) {
       params.push(before)
       conditions.push(`id < $${params.length}`)
     }
+    if (after !== null) {
+      params.push(after)
+      conditions.push(`id > $${params.length}`)
+    }
     const where = conditions.length ? `WHERE ${conditions.join(' AND ')}` : ''
     params.push(l)
-    const loans = await query<LoanRow>(`SELECT * FROM loans ${where} ORDER BY id DESC LIMIT $${params.length}`, params)
-    return loans.map(withLoanDerived)
+
+    const rows = await query<LoanProposalRow>(
+      `SELECT * FROM loan_proposals ${where} ORDER BY id ${order} LIMIT $${params.length}`,
+      params,
+    )
+    // The contract applies stake-weighted voting internally, but doesn't yet
+    // publish `weight` on `loan_vote` — every tally here is an unweighted
+    // headcount that can disagree with the on-chain result (issue #126).
+    // Flag it explicitly rather than presenting it as authoritative.
+    return rows.map((r) => ({ ...r, tallies_weighted: false }))
+  })
+
+  // --- Single loan proposal lookup (issue #398) ---
+  app.get<{ Params: { id: string } }>('/proposals/loan/:id', async (req, reply) => {
+    setCachePolicy(reply, 'public-live')
+    const id = entityIdParam(req.params.id)
+    if (id === null) {
+      return reply.code(400).send({ error: 'invalid proposal id' })
+    }
+    const proposal = await queryOne<LoanProposalRow>('SELECT * FROM loan_proposals WHERE id = $1', [Number(id)])
+    if (!proposal) return reply.code(404).send({ error: 'loan proposal not found' })
+    return { ...proposal, tallies_weighted: false }
+  })
+
+  // --- Loans (optional ?borrower= filter, ?status= filter, ?order=, ?before=, ?after= cursor) ---
+  app.get('/loans', {
+    schema: {
+      querystring: {
+        type: 'object',
+        properties: {
+          status: {
+            type: 'string',
+            enum: [...LOAN_STATUSES],
+            description: 'Filter by loan status.',
+          },
+          order: {
+            type: 'string',
+            enum: ['asc', 'desc'],
+            default: 'desc',
+            description: 'Sort ordering by loan id (asc or desc, default desc) (issue #508).',
+          },
+          before: {
+            type: 'string',
+            description: 'Pagination cursor for descending ordering: return rows with id strictly less than this value (issue #508).',
+          },
+          after: {
+            type: 'string',
+            description: 'Pagination cursor for ascending ordering: return rows with id strictly greater than this value (issue #508).',
+          },
+          limit: {
+            type: 'string',
+            description: 'Max rows to return (1-200, default 50).',
+          },
+          borrower: {
+            type: 'string',
+            description: 'Filter by borrower Stellar address.',
+          },
+        },
+      },
+    },
+  }, async (req, reply) => {
+    const q = req.query as Record<string, unknown>
+    if (invalidLimit(q.limit)) return reply.code(400).send({ error: 'invalid limit parameter' })
+    const l = limit(q.limit)
+    const before = cursor(q.before)
+    const after = cursor(q.after)
+    if (invalidCursor(q.before)) return reply.code(400).send({ error: 'invalid before cursor' })
+    if (invalidCursor(q.after)) return reply.code(400).send({ error: 'invalid after cursor' })
+    if (before !== null && after !== null) return reply.code(400).send({ error: 'cannot use before and after together' })
+    if (invalidOrder(q.order)) return reply.code(400).send({ error: 'invalid order parameter: expected asc or desc' })
+    const order = parseOrder(q.order) === 'asc' ? 'ASC' : 'DESC'
+    setCachePolicy(reply, historicalOrLive(before !== null || after !== null))
+
+    if (q.borrower !== undefined && q.borrower !== null && q.borrower !== '') {
+      if (typeof q.borrower !== 'string' || !validAddress(q.borrower)) {
+        return reply.code(400).send({ error: 'invalid Stellar address' })
+      }
+    }
+    const borrower = typeof q.borrower === 'string' && q.borrower ? q.borrower : null
+
+    // Issue #593: validate against the shared LOAN_STATUSES constant
+    // (src/types.ts) instead of a locally duplicated array, so there is
+    // exactly one place this list is written down.
+    if (q.status !== undefined && q.status !== null && q.status !== '') {
+      if (typeof q.status !== 'string' || !(LOAN_STATUSES as readonly string[]).includes(q.status)) {
+        return reply.code(400).send({ error: `invalid status parameter: expected one of ${LOAN_STATUSES.join(', ')}` })
+      }
+    }
+    const status = typeof q.status === 'string' && q.status ? q.status : null
+
+    const conditions: string[] = []
+    const params: unknown[] = []
+    if (borrower) {
+      params.push(borrower)
+      conditions.push(`borrower = $${params.length}`)
+    }
+    if (status) {
+      params.push(status)
+      conditions.push(`status = $${params.length}`)
+    }
+    if (before !== null) {
+      params.push(before)
+      conditions.push(`id < $${params.length}`)
+    }
+    if (after !== null) {
+      params.push(after)
+      conditions.push(`id > $${params.length}`)
+    }
+    const where = conditions.length ? `WHERE ${conditions.join(' AND ')}` : ''
+    params.push(l)
+    const loans = await query<LoanRow>(`SELECT * FROM loans ${where} ORDER BY id ${order} LIMIT $${params.length}`, params)
+    return loans.map((l) => withLoanDerived(l, req.log))
   })
 
   app.get<{ Params: { id: string } }>('/loans/:id', async (req, reply) => {
-    reply.header('Cache-Control', 'public, max-age=5, must-revalidate')
-    const rawId = req.params.id.trim()
-    if (!/^[0-9]+$/.test(rawId) || !Number.isSafeInteger(Number(rawId)) || Number(rawId) <= 0) {
+    setCachePolicy(reply, 'public-live')
+    const id = entityIdParam(req.params.id)
+    if (id === null) {
       return reply.code(400).send({ error: 'invalid loan id' })
     }
-    const loan = await queryOne<LoanRow>('SELECT * FROM loans WHERE id = $1', [Number(rawId)])
+    const loan = await queryOne<LoanRow>('SELECT * FROM loans WHERE id = $1', [Number(id)])
     if (!loan) return reply.code(404).send({ error: 'loan not found' })
-    return withLoanDerived(loan)
+    return withLoanDerived(loan, req.log)
   })
 
   // --- A loan's full event history (issue #26) ---
@@ -344,18 +782,110 @@ export async function registerRoutes(app: FastifyInstance, opts: { nonceStore: N
   // id covers the whole lifecycle. A nonexistent id returns an empty timeline
   // (200), not a 404 — the loan may simply have no events yet, and the caller
   // asked "what happened to this id", which is legitimately "nothing".
-  app.get<{ Params: { id: string } }>('/loans/:id/timeline', async (req, reply) => {
-    reply.header('Cache-Control', 'public, max-age=5, must-revalidate')
+  app.get<{ Params: { id: string } }>('/loans/:id/timeline', {
+    schema: {
+      tags: ['loans'],
+      summary: "A loan's full event history",
+      response: { 200: timelineResponseSchema },
+    },
+  }, async (req, reply) => {
+    setCachePolicy(reply, 'public-live')
     const id = entityIdParam(req.params.id)
     if (id === null) return reply.code(400).send({ error: 'invalid loan id' })
-    return { timeline: await entityTimeline(LOAN_TIMELINE_SYMBOLS, id) }
+    return entityTimeline(LOAN_TIMELINE_SYMBOLS, id)
   })
 
-  // --- Treasury proposals ---
-  app.get('/proposals/treasury', async (req, reply) => {
-    reply.header('Cache-Control', 'public, max-age=5, must-revalidate')
-    const l = limit((req.query as Record<string, unknown>).limit)
-    return query<TreasuryProposalRow>('SELECT * FROM treasury_proposals ORDER BY id DESC LIMIT $1', [l])
+  // --- Treasury proposals (optional ?status=, ?order=, ?before=, ?after= filters) ---
+  app.get('/proposals/treasury', {
+    schema: {
+      querystring: {
+        type: 'object',
+        properties: {
+          status: {
+            type: 'string',
+            enum: [...TREASURY_PROPOSAL_STATUSES],
+            description: 'Filter by treasury proposal status (issue #593). Must be one of TREASURY_PROPOSAL_STATUSES; anything else is a 400.',
+          },
+          order: {
+            type: 'string',
+            enum: ['asc', 'desc'],
+            default: 'desc',
+            description: 'Sort ordering by proposal id (asc or desc, default desc) (issue #508).',
+          },
+          before: {
+            type: 'string',
+            description: 'Pagination cursor for descending ordering: return rows with id strictly less than this value (issue #508).',
+          },
+          after: {
+            type: 'string',
+            description: 'Pagination cursor for ascending ordering: return rows with id strictly greater than this value (issue #508).',
+          },
+          limit: {
+            type: 'string',
+            description: 'Max rows to return (1-200, default 50).',
+          },
+        },
+      },
+    },
+  }, async (req, reply) => {
+    const q = req.query as Record<string, unknown>
+    if (invalidLimit(q.limit)) return reply.code(400).send({ error: 'invalid limit parameter' })
+    const l = limit(q.limit)
+    const before = cursor(q.before)
+    const after = cursor(q.after)
+    if (invalidCursor(q.before)) return reply.code(400).send({ error: 'invalid before cursor' })
+    if (invalidCursor(q.after)) return reply.code(400).send({ error: 'invalid after cursor' })
+    if (before !== null && after !== null) return reply.code(400).send({ error: 'cannot use before and after together' })
+    if (invalidOrder(q.order)) return reply.code(400).send({ error: 'invalid order parameter: expected asc or desc' })
+    const order = parseOrder(q.order) === 'asc' ? 'ASC' : 'DESC'
+
+    setCachePolicy(reply, historicalOrLive(before !== null || after !== null))
+
+    // Issue #593: an unrecognized ?status= is rejected explicitly, matching
+    // /api/loans's existing status validation — a typo'd status would
+    // otherwise silently return an empty page instead of a 400.
+    if (q.status !== undefined && q.status !== null && q.status !== '') {
+      if (typeof q.status !== 'string' || !(TREASURY_PROPOSAL_STATUSES as readonly string[]).includes(q.status)) {
+        return reply.code(400).send({ error: `invalid status parameter: expected one of ${TREASURY_PROPOSAL_STATUSES.join(', ')}` })
+      }
+    }
+    const status = typeof q.status === 'string' && q.status ? q.status : null
+
+    const conditions: string[] = []
+    const params: unknown[] = []
+    if (status) {
+      params.push(status)
+      conditions.push(`status = $${params.length}`)
+    }
+    if (before !== null) {
+      params.push(before)
+      conditions.push(`id < $${params.length}`)
+    }
+    if (after !== null) {
+      params.push(after)
+      conditions.push(`id > $${params.length}`)
+    }
+    const where = conditions.length ? `WHERE ${conditions.join(' AND ')}` : ''
+    params.push(l)
+
+    const rows = await query<TreasuryProposalRow>(
+      `SELECT * FROM treasury_proposals ${where} ORDER BY id ${order} LIMIT $${params.length}`,
+      params,
+    )
+    // See the matching comment on GET /proposals/loan above (issue #126).
+    return rows.map((r) => ({ ...r, tallies_weighted: false }))
+  })
+
+  // --- Single treasury proposal lookup (issue #398) ---
+  app.get<{ Params: { id: string } }>('/proposals/treasury/:id', async (req, reply) => {
+    setCachePolicy(reply, 'public-live')
+    const id = entityIdParam(req.params.id)
+    if (id === null) {
+      return reply.code(400).send({ error: 'invalid proposal id' })
+    }
+    const proposal = await queryOne<TreasuryProposalRow>('SELECT * FROM treasury_proposals WHERE id = $1', [Number(id)])
+    if (!proposal) return reply.code(404).send({ error: 'treasury proposal not found' })
+    return { ...proposal, tallies_weighted: false }
   })
 
   // --- A treasury proposal's full event history (issue #26) ---
@@ -364,24 +894,80 @@ export async function registerRoutes(app: FastifyInstance, opts: { nonceStore: N
   // proposals), executed. Loan and treasury proposal ids are drawn from
   // independent sequences and collide, so this is a distinct route rather
   // than a shared `/proposals/:id/timeline`. Same empty-not-404 contract.
-  app.get<{ Params: { id: string } }>('/proposals/treasury/:id/timeline', async (req, reply) => {
-    reply.header('Cache-Control', 'public, max-age=5, must-revalidate')
+  app.get<{ Params: { id: string } }>('/proposals/treasury/:id/timeline', {
+    schema: {
+      tags: ['proposals'],
+      summary: "A treasury proposal's full event history",
+      response: { 200: timelineResponseSchema },
+    },
+  }, async (req, reply) => {
+    setCachePolicy(reply, 'public-live')
     const id = entityIdParam(req.params.id)
     if (id === null) return reply.code(400).send({ error: 'invalid proposal id' })
-    return { timeline: await entityTimeline(TREASURY_TIMELINE_SYMBOLS, id) }
+    return entityTimeline(TREASURY_TIMELINE_SYMBOLS, id)
   })
 
-  // --- Notifications for an address ---
-  app.get('/notifications', async (req, reply) => {
-    reply.header('Cache-Control', 'private, no-cache')
+  // --- Notifications for an address (optional ?before=<id> cursor, optional ?unread=<boolean> filter)
+  app.get('/notifications', {
+    schema: {
+      tags: ['notifications'],
+      summary: 'Array of notifications',
+      response: {
+        200: {
+          type: 'array',
+          items: {
+            type: 'object',
+            properties: {
+              id: { type: 'integer' },
+              address: { type: 'string' },
+              type: { type: 'string', enum: ['success', 'error', 'warning', 'info'] },
+              title: { type: 'string' },
+              message: { type: 'string' },
+              ledger: { type: ['integer', 'null'] },
+              tx_hash: { type: ['string', 'null'] },
+              read: { type: 'boolean' },
+              event_id: { type: ['string', 'null'] },
+              created_at: { type: 'string' },
+            },
+          },
+        },
+        400: {
+          type: 'object',
+          properties: {
+            error: { type: 'string' },
+          },
+        },
+      },
+    },
+  }, async (req, reply) => {
+    setCachePolicy(reply, 'private')
     const q = req.query as Record<string, unknown>
-    if (typeof q.address !== 'string' || !q.address) {
-      return reply.code(400).send({ error: 'address query param is required' })
+    if (typeof q.address !== 'string' || !q.address || !validAddress(q.address)) {
+      return reply.code(400).send({ error: 'invalid Stellar address' })
     }
+    if (invalidLimit(q.limit)) return reply.code(400).send({ error: 'invalid limit parameter' })
     const l = limit(q.limit)
+    const before = cursor(q.before)
+    if (invalidCursor(q.before)) return reply.code(400).send({ error: 'invalid before cursor' })
+
+    const conditions = ['address = $1']
+    const params: unknown[] = [q.address]
+    if (q.unread !== undefined && q.unread !== null && q.unread !== '') {
+      if (q.unread !== 'true' && q.unread !== 'false' && q.unread !== true && q.unread !== false) {
+        return reply.code(400).send({ error: 'invalid unread parameter' })
+      }
+      const unreadVal = q.unread === 'true' || q.unread === true
+      params.push(unreadVal)
+      conditions.push(`read = $${params.length}`)
+    }
+    if (before !== null) {
+      params.push(before)
+      conditions.push(`id < $${params.length}`)
+    }
+    params.push(l)
     return query<NotificationRow>(
-      'SELECT * FROM notifications WHERE address = $1 ORDER BY id DESC LIMIT $2',
-      [q.address, l]
+      `SELECT * FROM notifications WHERE ${conditions.join(' AND ')} ORDER BY id DESC LIMIT $${params.length}`,
+      params
     )
   })
 
@@ -394,26 +980,93 @@ export async function registerRoutes(app: FastifyInstance, opts: { nonceStore: N
         timeWindow: config.http.rateLimitWindowMs,
       },
     },
+    schema: {
+      tags: ['events'],
+      summary: 'Paginated event feed',
+      querystring: {
+        type: 'object',
+        properties: {
+          symbol: {
+            type: 'string',
+            enum: Object.keys(EVENT_FIELDS),
+            description: 'Narrow the feed to one event symbol (issue #592). Must be one of the known event symbols; anything else is a 400.',
+          },
+        },
+      },
+      response: {
+        // Pre-existing mismatch fixed in passing: this declared the bare
+        // array shape, but the handler below has always returned
+        // `{ events, nextCursor }` — fast-json-stringify enforces the
+        // declared shape strictly, so every successful request 500'd before
+        // this fix (independently of the #592 symbol-validation change).
+        200: {
+          type: 'object',
+          properties: {
+            events: {
+              type: 'array',
+              items: {
+                type: 'object',
+                properties: {
+                  id: { type: 'string' },
+                  ledger: { type: 'integer' },
+                  closed_at: { type: 'string' },
+                  contract_id: { type: 'string' },
+                  symbol: { type: 'string' },
+                  topics: {},
+                  data: {},
+                  tx_hash: { type: ['string', 'null'] },
+                  decode_error: { type: ['string', 'null'] },
+                  created_at: { type: 'string' },
+                },
+              },
+            },
+            nextCursor: { type: 'string' },
+          },
+        },
+        400: {
+          type: 'object',
+          properties: {
+            error: { type: 'string' },
+          },
+        },
+      },
+    },
   }, async (req, reply) => {
     const q = req.query as Record<string, unknown>
+    if (invalidLimit(q.limit)) return reply.code(400).send({ error: 'invalid limit parameter' })
     const l = limit(q.limit)
     const before = eventCursor(q.before)
     const after = eventCursor(q.after)
-    
+
     if (invalidEventCursor(q.before)) return reply.code(400).send({ error: 'invalid before cursor' })
     if (invalidEventCursor(q.after)) return reply.code(400).send({ error: 'invalid after cursor' })
     if (before !== null && after !== null) return reply.code(400).send({ error: 'cannot use before and after together' })
-    
-    const order = typeof q.order === 'string' && q.order === 'asc' ? 'ASC' : 'DESC'
 
-    if (before !== null || after !== null) {
-      reply.header('Cache-Control', 'public, max-age=31536000, immutable')
-    } else {
-      reply.header('Cache-Control', 'public, max-age=5, must-revalidate')
+    // Issue #278: ledger-range filter, additive with symbol/contract/
+    // decode_error/before/after below.
+    if (invalidLedgerRange(q.from_ledger, q.to_ledger)) {
+      return reply.code(400).send({
+        error: 'invalid ledger range: from_ledger/to_ledger must be non-negative integers, from_ledger <= to_ledger, and the range must not exceed 10000 ledgers',
+      })
     }
+    const fromLedger = ledgerBound(q.from_ledger)
+    const toLedger = ledgerBound(q.to_ledger)
 
+    if (invalidOrder(q.order)) return reply.code(400).send({ error: 'invalid order parameter: expected asc or desc' })
+    const order = parseOrder(q.order) === 'asc' ? 'ASC' : 'DESC'
+
+    setCachePolicy(reply, historicalOrLive(before !== null || after !== null))
+
+    // Issue #592: an unrecognized ?symbol= is rejected explicitly, matching
+    // /members/:address/activity's ?symbol= validation (issue #193) — the
+    // unfiltered query could never have returned it, so a silently empty
+    // page would only hide a client typo.
     const symbol = typeof q.symbol === 'string' && q.symbol ? q.symbol : null
+    if (symbol !== null && !isKnownSymbol(symbol)) {
+      return reply.code(400).send({ error: `invalid symbol filter: expected one of ${Object.keys(EVENT_FIELDS).join(', ')}` })
+    }
     const contract = typeof q.contract === 'string' && q.contract ? q.contract : null
+    const decodeError = q.decode_error === 'true'
 
     const conditions: string[] = []
     const params: unknown[] = []
@@ -424,6 +1077,21 @@ export async function registerRoutes(app: FastifyInstance, opts: { nonceStore: N
     if (contract) {
       params.push(contract)
       conditions.push(`contract_id = $${params.length}`)
+    }
+    if (decodeError) {
+      conditions.push(`decode_error IS NOT NULL`)
+    }
+    // Issue #278: plain `ledger >= $N` / `ledger <= $N` — no function or cast
+    // wraps the column, so Postgres can still use events_ledger_id_idx
+    // (a btree on (ledger, id), see src/db/migrations/0015_events_ledger_id_idx.sql)
+    // for these range conditions.
+    if (fromLedger !== null) {
+      params.push(fromLedger)
+      conditions.push(`ledger >= $${params.length}`)
+    }
+    if (toLedger !== null) {
+      params.push(toLedger)
+      conditions.push(`ledger <= $${params.length}`)
     }
     if (before !== null) {
       if (before.id) {
@@ -443,15 +1111,15 @@ export async function registerRoutes(app: FastifyInstance, opts: { nonceStore: N
         conditions.push(`ledger > $${params.length}`)
       }
     }
-    
+
     const where = conditions.length ? `WHERE ${conditions.join(' AND ')}` : ''
     params.push(l)
-    
+
     const events = await query<EventRow>(
       `SELECT * FROM events ${where} ORDER BY ledger ${order}, id ${order} LIMIT $${params.length}`,
       params
     )
-    
+
     const response: { events: EventRow[], nextCursor?: string } = { events }
     const lastEvent = events[events.length - 1]
     if (lastEvent) {
@@ -463,15 +1131,16 @@ export async function registerRoutes(app: FastifyInstance, opts: { nonceStore: N
   // --- Mark a single notification as read ---
   app.patch<{ Params: { id: string } }>('/notifications/:id/read', async (req, reply) => {
     // First authenticate the request
-    const auth = await authenticateRequest(req.headers, nonceStore)
+    const auth = await authenticateRequest(req.headers, nonceStore, undefined, req.log, authFailureTracker)
     if (!auth.authenticated) {
       return reply.code(auth.status).send({ error: auth.error || 'Authentication required' })
     }
 
-    const id = Number(req.params.id)
-    if (!Number.isFinite(id)) {
+    const rawId = entityIdParam(req.params.id)
+    if (rawId === null) {
       return reply.code(400).send({ error: 'invalid notification id' })
     }
+    const id = Number(rawId)
 
     // Get the notification to check ownership
     const notification = await queryOne<NotificationRow>(
@@ -482,10 +1151,10 @@ export async function registerRoutes(app: FastifyInstance, opts: { nonceStore: N
 
     // Ownership check uses the address `authenticateRequest` proved control
     // of — never a second parse of the raw header (issue #70).
-    if (notification.address !== auth.address) {
+    if (notification.address !== auth.ed25519Address) {
       return reply.code(403).send({ error: 'Cannot modify notifications for another address' })
     }
-    
+
     const row = await queryOne<NotificationRow>(
       'UPDATE notifications SET read = true WHERE id = $1 RETURNING *',
       [id]
@@ -497,16 +1166,16 @@ export async function registerRoutes(app: FastifyInstance, opts: { nonceStore: N
   // --- Mark all of an address's notifications as read ---
   app.patch('/notifications/read-all', async (req, reply) => {
     const q = req.query as Record<string, unknown>
-    if (typeof q.address !== 'string' || !q.address) {
-      return reply.code(400).send({ error: 'address query param is required' })
+    if (typeof q.address !== 'string' || !q.address || !validAddress(q.address)) {
+      return reply.code(400).send({ error: 'invalid Stellar address' })
     }
-    
+
     // Authenticate the request and verify the address matches
-    const auth = await authenticateRequest(req.headers, nonceStore, q.address)
+    const auth = await authenticateRequest(req.headers, nonceStore, q.address, req.log, authFailureTracker)
     if (!auth.authenticated) {
       return reply.code(auth.status).send({ error: auth.error || 'Authentication required' })
     }
-    
+
     const rows = await query<NotificationRow>(
       'UPDATE notifications SET read = true WHERE address = $1 AND read = false RETURNING id',
       [q.address]
@@ -516,25 +1185,86 @@ export async function registerRoutes(app: FastifyInstance, opts: { nonceStore: N
 
   // --- Admin/governance audit log (init, admin add/remove, threshold,
   // policy, pause/unpause) ---
-  app.get('/admin/log', async (req, reply) => {
+  app.get('/admin/log', {
+    // Issue #280: first `schema:` block in this file — see the block comment
+    // above /admin/failed-events below for why these two routes only
+    // document the response codes their handlers can actually produce (no
+    // 401: neither route is auth-gated; no 404: both always return an array,
+    // empty or not).
+    schema: {
+      tags: ['admin'],
+      summary: 'Admin/governance audit log',
+      description:
+        'Raw events for admin/governance-lifecycle symbols only (init, admin add/remove, threshold, policy, pause/unpause) — a public audit trail read straight off the chain. Optionally scoped to one contract deployment.',
+      querystring: {
+        type: 'object',
+        properties: {
+          limit: { type: 'string', description: 'Max rows to return (1-200, default 50).' },
+          before: { type: 'string', description: 'Pagination cursor: return rows with a strictly smaller ledger than this value.' },
+          contract: { type: 'string', description: 'Restrict to one contract deployment id.' },
+          symbol: {
+            type: 'string',
+            enum: [...ADMIN_EVENT_SYMBOLS],
+            description: 'Filter by admin event symbol (issue #509). Must be one of ADMIN_EVENT_SYMBOLS; anything else is a 400.',
+          },
+        },
+      },
+      response: {
+        200: {
+          type: 'array',
+          items: {
+            type: 'object',
+            properties: {
+              id: { type: 'string' },
+              ledger: { type: 'integer' },
+              closed_at: { type: 'string', format: 'date-time' },
+              contract_id: { type: 'string' },
+              symbol: { type: 'string' },
+              topics: {},
+              data: {},
+              tx_hash: { type: 'string', nullable: true },
+              decode_error: { type: 'string', nullable: true },
+              created_at: { type: 'string', format: 'date-time' },
+            },
+          },
+        },
+        400: {
+          type: 'object',
+          properties: { error: { type: 'string' } },
+        },
+      },
+    },
+  }, async (req, reply) => {
     const q = req.query as Record<string, unknown>
+    if (invalidLimit(q.limit)) return reply.code(400).send({ error: 'invalid limit parameter' })
     const l = limit(q.limit)
     const before = cursor(q.before)
-    
+
     if (invalidCursor(q.before)) return reply.code(400).send({ error: 'invalid before cursor' })
-    
-    if (before !== null) {
-      reply.header('Cache-Control', 'public, max-age=31536000, immutable')
-    } else {
-      reply.header('Cache-Control', 'public, max-age=5, must-revalidate')
+
+    setCachePolicy(reply, historicalOrLive(before !== null))
+
+    // Issue #509: optional `?symbol=` filter. Reject values not in ADMIN_EVENT_SYMBOLS.
+    const symbolFilter = q.symbol
+    if (symbolFilter !== undefined && !isAdminEventSymbol(symbolFilter)) {
+      return reply.code(400).send({
+        error: `invalid symbol filter: expected one of ${ADMIN_EVENT_SYMBOLS.join(', ')}`,
+      })
     }
+
     // `?contract=<C...>` scopes to one deployment, same as /events (issue #16).
     const contract = typeof q.contract === 'string' && q.contract ? q.contract : null
-    const params: unknown[] = [ADMIN_EVENT_SYMBOLS as unknown as string[]]
-    let where = `WHERE symbol = ANY($1)`
+    const params: unknown[] = [symbolFilter ?? (ADMIN_EVENT_SYMBOLS as unknown as string[])]
+    let where = symbolFilter !== undefined
+      ? `WHERE symbol = $1`
+      : `WHERE symbol = ANY($1)`
     if (contract) {
       params.push(contract)
       where += ` AND contract_id = $${params.length}`
+    }
+    if (before !== null) {
+      params.push(before)
+      where += ` AND ledger < $${params.length}`
     }
     params.push(l)
     return query<EventRow>(
@@ -551,16 +1281,13 @@ export async function registerRoutes(app: FastifyInstance, opts: { nonceStore: N
   // sum credited to members (documented in the README).
   app.get('/interest', async (req, reply) => {
     const q = req.query as Record<string, unknown>
+    if (invalidLimit(q.limit)) return reply.code(400).send({ error: 'invalid limit parameter' })
     const l = limit(q.limit)
     const before = cursor(q.before)
     if (invalidCursor(q.before)) return reply.code(400).send({ error: 'invalid before cursor' })
-    
-    if (before !== null) {
-      reply.header('Cache-Control', 'public, max-age=31536000, immutable')
-    } else {
-      reply.header('Cache-Control', 'public, max-age=5, must-revalidate')
-    }
-    
+
+    setCachePolicy(reply, historicalOrLive(before !== null))
+
     const params: unknown[] = []
     let where = ''
     if (before !== null) {
@@ -576,39 +1303,59 @@ export async function registerRoutes(app: FastifyInstance, opts: { nonceStore: N
     )
   })
 
-  // --- Documents attached to a proposal (issue #44, ?before=<ledger> cursor) ---
+  // --- Documents attached to proposals (issue #44, ?before=<ledger> cursor) ---
   // One row per `doc_attn` event — existence/history only, never the content
   // hash (still read live from the contract via get_document). A single
-  // `?kind=&proposal_id=` endpoint rather than two per-family routes: loan
-  // and treasury proposal ids are drawn from independent sequences and
-  // collide, so `kind` is required alongside `proposal_id` either way, and
-  // one route keeps the pagination/validation logic in one place.
+  // endpoint rather than per-family routes: loan and treasury proposal ids are
+  // drawn from independent sequences and collide, so `proposal_id` is only
+  // meaningful alongside `kind`, and one route keeps the pagination/validation
+  // logic in one place.
+  //
+  // Issue #189: every filter is optional, like the other list endpoints —
+  // no filter lists all documents newest-ledger-first, `?caller=` a member's
+  // attachment history, `?kind=` one proposal family. `?kind=&proposal_id=`
+  // is the original per-proposal query, unchanged. Each shape has an index:
+  // documents_proposal_idx, documents_caller_idx, documents_ledger_idx.
   app.get('/documents', async (req, reply) => {
     const q = req.query as Record<string, unknown>
+    if (invalidLimit(q.limit)) return reply.code(400).send({ error: 'invalid limit parameter' })
     const l = limit(q.limit)
     const before = cursor(q.before)
     if (invalidCursor(q.before)) return reply.code(400).send({ error: 'invalid before cursor' })
-    
-    if (before !== null) {
-      reply.header('Cache-Control', 'public, max-age=31536000, immutable')
-    } else {
-      reply.header('Cache-Control', 'public, max-age=5, must-revalidate')
-    }
-    
+
+    // Issue #262: set cache policy for document queries to ensure ETag
+    // generation is deterministic, especially for empty result sets.
+    setCachePolicy(reply, historicalOrLive(before !== null))
+
+    const params: unknown[] = []
+    const conditions: string[] = []
     const kind = q.kind
-    if (kind !== 'loan' && kind !== 'treasury') {
-      return reply.code(400).send({ error: 'kind query param must be "loan" or "treasury"' })
+    if (kind !== undefined || q.proposal_id !== undefined) {
+      if (kind !== 'loan' && kind !== 'treasury') {
+        return reply.code(400).send({ error: 'kind query param must be "loan" or "treasury"' })
+      }
+      params.push(kind)
+      conditions.push(`kind = $${params.length}`)
     }
-    if (typeof q.proposal_id !== 'string' || !/^[0-9]+$/.test(q.proposal_id)) {
-      return reply.code(400).send({ error: 'proposal_id query param is required' })
+    if (q.proposal_id !== undefined) {
+      if (typeof q.proposal_id !== 'string' || !/^[0-9]+$/.test(q.proposal_id)) {
+        return reply.code(400).send({ error: 'invalid proposal_id query param' })
+      }
+      params.push(Number(q.proposal_id))
+      conditions.push(`proposal_id = $${params.length}`)
     }
-    const proposalId = Number(q.proposal_id)
-    const params: unknown[] = [kind, proposalId]
-    let where = `WHERE kind = $1 AND proposal_id = $2`
+    if (q.caller !== undefined) {
+      if (typeof q.caller !== 'string' || !validAddress(q.caller)) {
+        return reply.code(400).send({ error: 'invalid Stellar address' })
+      }
+      params.push(q.caller)
+      conditions.push(`caller = $${params.length}`)
+    }
     if (before !== null) {
       params.push(before)
-      where += ` AND ledger < $${params.length}`
+      conditions.push(`ledger < $${params.length}`)
     }
+    const where = conditions.length ? `WHERE ${conditions.join(' AND ')}` : ''
     params.push(l)
     return query<DocumentRow>(
       `SELECT id, proposal_id, kind, caller, ledger, tx_hash, attached_at
@@ -624,14 +1371,382 @@ export async function registerRoutes(app: FastifyInstance, opts: { nonceStore: N
   // (without touching the append-only `events` row), and moves on. This is
   // the operator-facing view of that; `/api/stats.quarantinedEvents` is the
   // dashboard-facing count.
-  app.get('/admin/failed-events', async (req, reply) => {
-    reply.header('Cache-Control', 'public, max-age=5, must-revalidate')
+  //
+  // Issue #163: the `/admin/` prefix has two different meanings in this file
+  // — `/admin/log` is a public governance audit trail read straight off the
+  // chain, with nothing sensitive in it, while this endpoint surfaces
+  // `failed_events.error`, which is the raw driver/handler exception text
+  // `classifyError` goes to some trouble to keep out of every other
+  // response. Rather than invent an admin-auth scheme this codebase has no
+  // other trace of, `/admin/` here means "operator diagnostics": reachable
+  // without authentication, but never echoing back anything an unauthed
+  // caller couldn't already learn some other way. So the fix mirrors
+  // `classifyError`'s own rule — raw exception text is never put in a
+  // response, only logged (and still queryable directly against Postgres by
+  // an operator) — rather than gating the whole endpoint behind auth.
+  app.get('/admin/failed-events', {
+    // Issue #280: documents the quarantine view referenced above — "admin"
+    // here means operator diagnostics, not an auth-gated route (see the
+    // block comment above this handler), so no 401 is documented; the
+    // handler always returns an array (possibly empty), so no 404 either —
+    // only the response codes it can actually produce.
+    schema: {
+      tags: ['admin'],
+      summary: 'Quarantined (deterministically-failed) events',
+      description:
+        'Events whose fold handler threw deterministically and were isolated rather than retried forever (issue #43) — the operator-facing view of the quarantine. Never includes the raw exception text; that is logged, not returned, so this endpoint stays safe to leave unauthenticated.',
+      querystring: {
+        type: 'object',
+        properties: {
+          limit: { type: 'string', description: 'Max rows to return (1-200, default 50).' },
+          before: { type: 'string', description: 'Pagination cursor: return rows with a strictly smaller id than this value.' },
+          unresolved: { type: 'string', enum: ['true', 'false'], description: 'When "true", only rows a reindex/replay has not yet resolved.' },
+          symbol: { type: 'string', description: 'Only failures of events with this symbol (issue #192).' },
+          contract: { type: 'string', description: 'Only failures from this contract deployment.' },
+          from_ledger: { type: 'string', description: 'Only failures from this ledger onwards (issue #192).' },
+          to_ledger: { type: 'string', description: 'Only failures up to and including this ledger (issue #192). With from_ledger, the range may span at most 10000 ledgers.' },
+        },
+      },
+      response: {
+        200: {
+          type: 'array',
+          headers: {
+            'x-total-count': {
+              type: 'integer',
+              description: 'Rows matching every filter except the before cursor: the size of the whole quarantine, however far the page is (issue #192).',
+            },
+          },
+          items: {
+            type: 'object',
+            properties: {
+              id: { type: 'integer' },
+              event_id: { type: 'string' },
+              contract_id: { type: 'string', nullable: true },
+              symbol: { type: 'string' },
+              ledger: { type: 'integer' },
+              created_at: { type: 'string', format: 'date-time' },
+              resolved_at: { type: 'string', format: 'date-time', nullable: true },
+            },
+          },
+        },
+        400: {
+          type: 'object',
+          properties: { error: { type: 'string' } },
+        },
+      },
+    },
+  }, async (req, reply) => {
     const q = req.query as Record<string, unknown>
+    if (invalidLimit(q.limit)) return reply.code(400).send({ error: 'invalid limit parameter' })
     const l = limit(q.limit)
-    return query<FailedEventRow>(
-      'SELECT * FROM failed_events ORDER BY id DESC LIMIT $1',
-      [l]
+    const before = cursor(q.before)
+    if (invalidCursor(q.before)) return reply.code(400).send({ error: 'invalid before cursor' })
+
+    // Issue #168: `?unresolved=true` narrows to records a reindex or replay
+    // hasn't repaired yet — the live-problem view; omitting it returns the
+    // full history, resolved records included.
+    const onlyUnresolved = q.unresolved === 'true'
+
+    // Issue #192: symbol and ledger-range filters, validated with the same
+    // helpers /events uses so the two feeds reject the same inputs.
+    if (q.symbol !== undefined && (typeof q.symbol !== 'string' || q.symbol.trim() === '')) {
+      return reply.code(400).send({ error: 'invalid symbol filter' })
+    }
+    const symbol = typeof q.symbol === 'string' ? q.symbol.trim() : null
+    const contract = typeof q.contract === 'string' && q.contract ? q.contract : null
+    if (invalidLedgerRange(q.from_ledger, q.to_ledger)) {
+      return reply.code(400).send({
+        error: 'invalid ledger range: from_ledger/to_ledger must be non-negative integers, from_ledger <= to_ledger, and the range must not exceed 10000 ledgers',
+      })
+    }
+    const fromLedger = ledgerBound(q.from_ledger)
+    const toLedger = ledgerBound(q.to_ledger)
+
+    const params: unknown[] = []
+    const conditions: string[] = []
+    if (onlyUnresolved) {
+      conditions.push(`resolved_at IS NULL`)
+    }
+    if (symbol !== null) {
+      params.push(symbol)
+      conditions.push(`symbol = $${params.length}`)
+    }
+    if (contract !== null) {
+      params.push(contract)
+      conditions.push(`contract_id = $${params.length}`)
+    }
+    if (fromLedger !== null) {
+      params.push(fromLedger)
+      conditions.push(`ledger >= $${params.length}`)
+    }
+    if (toLedger !== null) {
+      params.push(toLedger)
+      conditions.push(`ledger <= $${params.length}`)
+    }
+    // The total counts everything the filters match, cursor excluded, so an
+    // operator sees the scale of the quarantine without paging to the end.
+    const filterWhere = conditions.length > 0 ? `WHERE ${conditions.join(' AND ')}` : ''
+    const total = await queryOne<{ total: number }>(
+      `SELECT count(*)::int AS total FROM failed_events ${filterWhere}`,
+      [...params]
     )
+    reply.header('X-Total-Count', String(total?.total ?? 0))
+
+    if (before !== null) {
+      params.push(before)
+      conditions.push(`id < $${params.length}`)
+    }
+    const where = conditions.length > 0 ? `WHERE ${conditions.join(' AND ')}` : ''
+    params.push(l)
+    const rows = await query<Omit<FailedEventRow, 'error'>>(
+      `SELECT id, event_id, contract_id, symbol, ledger, created_at, resolved_at
+         FROM failed_events ${where}
+        ORDER BY id DESC LIMIT $${params.length}`,
+      params
+    )
+    return rows
+  })
+
+  // --- Quarantine escalation state (issue #505) ---
+  // Same `/admin/` convention as /admin/failed-events above: unauthenticated
+  // operator diagnostic, read-only, and never echoing raw exception text.
+  // `quarantine_state.error_message` is deliberately not selected at all —
+  // it is the same class of handler-exception text /admin/failed-events
+  // withholds. `escalated_at IS NOT NULL` is the "currently escalated" flag:
+  // persistQuarantineState() clears it on a successful fold and keeps it once
+  // escalation has happened (see src/indexer/poller.ts).
+  app.get('/admin/quarantine-state', {
+    schema: {
+      tags: ['admin'],
+      summary: 'Per-contract quarantine escalation state',
+      description:
+        'Read-only operator diagnostic over quarantine_state: consecutive whole-page failure count and escalation timestamp per tailed contract. Unauthenticated, like /admin/failed-events; raw error_message and all exception text are never returned. Use ?contract= to scope to one contract.',
+      querystring: {
+        type: 'object',
+        properties: {
+          contract: { type: 'string', description: 'Only the quarantine state for this contract id.' },
+        },
+      },
+      response: {
+        200: {
+          type: 'array',
+          items: {
+            type: 'object',
+            properties: {
+              contract_id: { type: 'string' },
+              failures: { type: 'integer', description: 'Current consecutive whole-page failure count.' },
+              escalated: { type: 'boolean', description: 'True while escalated_at is set.' },
+              escalated_at: { type: ['string', 'null'], format: 'date-time' },
+            },
+          },
+        },
+        400: {
+          type: 'object',
+          properties: { error: { type: 'string' } },
+        },
+      },
+    },
+  }, async (req, reply) => {
+    const q = req.query as Record<string, unknown>
+    const contract = contractFilter(q.contract)
+    if (contract === undefined) return reply.code(400).send({ error: 'invalid contract filter' })
+
+    const rows = await query<{
+      contract_id: string
+      failures: number
+      escalated_at: string | null
+    }>(
+      `SELECT contract_id, failures, escalated_at
+         FROM quarantine_state
+         ${contract === null ? '' : 'WHERE contract_id = $1'}
+        ORDER BY contract_id`,
+      contract === null ? [] : [contract]
+    )
+    return rows.map((row) => ({
+      contract_id: row.contract_id,
+      failures: row.failures,
+      escalated: row.escalated_at != null,
+      escalated_at: row.escalated_at == null ? null : new Date(row.escalated_at).toISOString(),
+    }))
+  })
+
+  // --- Re-evaluate a quarantined event (issue #283) ---
+  // The middle ground between "leave it quarantined" and `npm run reindex`
+  // (which rebuilds every derived table from the entire raw log): re-attempt
+  // the fold for exactly this one event, once a contract or decoder fix has
+  // shipped, without a maintainer hand-editing `failed_events`/`events` over
+  // psql. All the actual logic (advisory-lock coordination with the live
+  // poller/reindex, idempotency, updating the existing failed_events row
+  // rather than inserting a new one) already lives in
+  // `indexer/replay.ts`'s `replayFailedEvent` — added for `npm run
+  // replay-failed` (issue #170) — this route is the HTTP door onto it.
+  //
+  // Issue #291: requires authentication to write to admin_audit_log.
+  app.post<{ Params: { id: string } }>('/admin/failed-events/:id/re-evaluate', async (req, reply) => {
+    const auth = await authenticateRequest(req.headers, nonceStore, undefined, req.log, authFailureTracker)
+    if (!auth.authenticated) {
+      return reply.code(auth.status).send({ error: auth.error || 'Authentication required' })
+    }
+
+    const eventId = req.params.id.trim()
+    if (!eventId) return reply.code(400).send({ error: 'invalid event id' })
+
+    // Propagates uncaught on a lock conflict (ReplayLockError carries its
+    // own statusCode; classifyError formats it) or any other unexpected
+    // throw (falls through to a generic 500, message withheld).
+    const outcome = await replayFailedEvent(eventId)
+
+    void writeAuditLog(auth.address, 'resolve_quarantined_event', req.ip ?? null, { eventId, status: outcome.status }, req.log)
+
+    if (outcome.status === 'still_failing') {
+      return reply.code(422).send({ eventId: outcome.eventId, status: outcome.status })
+    }
+    return { eventId: outcome.eventId, status: outcome.status }
+  })
+
+  // Issue #287: resolving quarantined events one at a time via direct SQL
+  // doesn't scale once a bad handler/schema change quarantines a batch of
+  // them at once. Accepts up to 500 ids per call (matching this codebase's
+  // other batch-size ceilings) and only touches rows that are still
+  // unresolved — an id that's already resolved, or doesn't exist, is
+  // silently excluded from the count rather than erroring the whole batch,
+  // since a stale/duplicate id in an admin's list shouldn't block resolving
+  // the rest.
+  // Issue #291: requires authentication to write to admin_audit_log.
+  const MAX_BATCH_RESOLVE_IDS = 500
+  app.post('/admin/failed-events/batch-resolve', async (req, reply) => {
+    const auth = await authenticateRequest(req.headers, nonceStore, undefined, req.log, authFailureTracker)
+    if (!auth.authenticated) {
+      return reply.code(auth.status).send({ error: auth.error || 'Authentication required' })
+    }
+
+    const body = req.body as { ids?: unknown; resolution?: unknown; note?: unknown }
+    const ids = body.ids
+    if (!Array.isArray(ids) || ids.length === 0) {
+      return reply.code(400).send({ error: 'ids must be a non-empty array' })
+    }
+    if (ids.length > MAX_BATCH_RESOLVE_IDS) {
+      return reply.code(400).send({ error: `ids must not exceed ${MAX_BATCH_RESOLVE_IDS} entries` })
+    }
+    if (!ids.every((id) => Number.isSafeInteger(id) && id > 0)) {
+      return reply.code(400).send({ error: 'ids must all be positive integers' })
+    }
+    const resolution = body.resolution
+    if (resolution !== 'resolved' && resolution !== 'ignored') {
+      return reply.code(400).send({ error: "resolution must be 'resolved' or 'ignored'" })
+    }
+    const note = body.note
+    if (note !== undefined && typeof note !== 'string') {
+      return reply.code(400).send({ error: 'note must be a string' })
+    }
+
+    const resolvedCount = await withTransaction(async (client) => {
+      const result = await client.query(
+        `UPDATE failed_events
+            SET resolved_at = now(), resolution = $1, resolution_note = $2
+          WHERE id = ANY($3::bigint[]) AND resolved_at IS NULL`,
+        [resolution, note ?? null, ids]
+      )
+      return result.rowCount ?? 0
+    })
+
+    void writeAuditLog(auth.address, 'resolve_quarantined_event', req.ip ?? null, { ids, resolution, note: note ?? null, resolved: resolvedCount }, req.log)
+
+    return { resolved: resolvedCount }
+  })
+
+  // --- Clear reorg halt (issue #402) ---
+  // Acknowledges a recorded ledger discontinuity without a full reindex
+  // (e.g. for false alarms). Clears the halt and writes to admin_audit_log.
+  app.post('/admin/clear-reorg', {
+    schema: {
+      summary: 'Clear reorg halt',
+      tags: ['admin'],
+      description: 'Acknowledges a recorded ledger discontinuity without rebuilding. Clears uncleared reorg halts and records the action into admin_audit_log (issue #402).',
+    },
+  }, async (req, reply) => {
+    let adminAddress = 'operator'
+    const authHeader = req.headers.authorization
+    if (authHeader) {
+      const auth = await authenticateRequest(req.headers, nonceStore, undefined, req.log, authFailureTracker)
+      if (!auth.authenticated) {
+        return reply.code(auth.status).send({ error: auth.error || 'Authentication required' })
+      }
+      adminAddress = auth.address
+    } else if (typeof req.headers['x-admin-address'] === 'string' && req.headers['x-admin-address']) {
+      adminAddress = req.headers['x-admin-address']
+    }
+
+    const result = await clearRecordedReorg({
+      adminAddress,
+      ipAddress: req.ip ?? null,
+    })
+    return result
+  })
+
+  // --- Admin audit log (issue #291) ---
+  // Exposes the immutable admin_audit_log table to authorized maintainers.
+  // Authentication is required: only a holder of a valid Stellar signature
+  // can read the trail — it contains admin addresses and IP addresses that
+  // should not be publicly readable.
+  //
+  // Pagination follows the same `?before=<id>` cursor pattern as every other
+  // list endpoint in this file. `?admin=<G…>` filters to a single operator's
+  // actions; `?action=<label>` filters to a single action type.
+  app.get('/admin/audit-log', async (req, reply) => {
+    // Require authentication — this endpoint surfaces IP addresses and admin
+    // identities that are not appropriate for unauthenticated callers.
+    const auth = await authenticateRequest(req.headers, nonceStore, undefined, req.log, authFailureTracker)
+    if (!auth.authenticated) {
+      return reply.code(auth.status).send({ error: auth.error || 'Authentication required' })
+    }
+
+    const q = req.query as Record<string, unknown>
+    if (invalidLimit(q.limit)) return reply.code(400).send({ error: 'invalid limit parameter' })
+    const l = limit(q.limit)
+    const before = cursor(q.before)
+    if (invalidCursor(q.before)) return reply.code(400).send({ error: 'invalid before cursor' })
+
+    // Optional filter by admin address.
+    if (q.admin !== undefined && q.admin !== '') {
+      if (typeof q.admin !== 'string' || !validAddress(q.admin)) {
+        return reply.code(400).send({ error: 'invalid Stellar address' })
+      }
+    }
+    // Optional filter by action type — any non-empty string is accepted so
+    // future action labels don't require a server deploy to query.
+    // An empty `?action=` means "no filter", like every other optional
+    // string filter in this file; only a non-string (repeated param) is an error.
+    if (q.action !== undefined && typeof q.action !== 'string') {
+      return reply.code(400).send({ error: 'invalid action filter' })
+    }
+
+    const params: unknown[] = []
+    const conditions: string[] = []
+
+    if (before !== null) {
+      params.push(before)
+      conditions.push(`id < $${params.length}`)
+    }
+    if (typeof q.admin === 'string' && q.admin) {
+      params.push(q.admin)
+      conditions.push(`admin_address = $${params.length}`)
+    }
+    if (typeof q.action === 'string' && q.action.trim()) {
+      params.push(q.action.trim())
+      conditions.push(`action = $${params.length}`)
+    }
+
+    const where = conditions.length ? `WHERE ${conditions.join(' AND ')}` : ''
+    params.push(l)
+
+    const rows = await query<AdminAuditLogRow>(
+      `SELECT id, admin_address, action, ip_address, payload, created_at
+         FROM admin_audit_log ${where}
+        ORDER BY id DESC LIMIT $${params.length}`,
+      params
+    )
+    return rows
   })
 
   // --- Aggregate stats (with indexer freshness — issue #2) ---
@@ -643,6 +1758,7 @@ export async function registerRoutes(app: FastifyInstance, opts: { nonceStore: N
   // instance — a fresh registerRoutes() closure per buildServer() — so it
   // never leaks across tests or restarts.
   let statsCache: { at: number; value: DAOStats } | null = null
+  const statsGate = new ConcurrencyGate(Math.max(1, config.http.statsMaxConcurrent))
 
   async function computeStats(parent?: Span): Promise<DAOStats> {
     // Issue #530: one child span around the aggregate — it is the heaviest
@@ -662,6 +1778,7 @@ export async function registerRoutes(app: FastifyInstance, opts: { nonceStore: N
       total_defaulted_value: string | null
       total_treasury_proposals: string
       total_staked: string | null
+      total_contribution: string | null
       interest_collected: string | null
       principal_lent: string | null
       principal_repaid: string | null
@@ -670,6 +1787,11 @@ export async function registerRoutes(app: FastifyInstance, opts: { nonceStore: N
       last_ledger: number | null
       observed_tip_ledger: number | null
       cursor_updated_at: string | null
+      quarantine_escalated_at: string | null
+      reorg_detected_at: string | null
+      reorg_contract_id: string | null
+      reorg_last_ledger: number | null
+      reorg_detail: string | null
     }>(
       // Member counts mirror the contract's two distinct getters:
       // get_total_members (all-time) vs get_active_members (current). Both
@@ -688,6 +1810,7 @@ export async function registerRoutes(app: FastifyInstance, opts: { nonceStore: N
          (SELECT COALESCE(sum(outstanding), 0) FROM loans WHERE status = 'defaulted') AS total_defaulted_value,
          (SELECT count(*) FROM treasury_proposals)                                 AS total_treasury_proposals,
          (SELECT COALESCE(sum(stake), 0) FROM members WHERE exited = false)         AS total_staked,
+         (SELECT COALESCE(sum(contribution), 0) FROM members WHERE exited = false)  AS total_contribution,
          (SELECT interest_collected FROM dao_totals WHERE id = 1)                  AS interest_collected,
          (SELECT principal_lent     FROM dao_totals WHERE id = 1)                  AS principal_lent,
          (SELECT principal_repaid   FROM dao_totals WHERE id = 1)                  AS principal_repaid,
@@ -709,7 +1832,31 @@ export async function registerRoutes(app: FastifyInstance, opts: { nonceStore: N
     const ledgersBehind = lastLedger != null && tipLedger != null && tipLedger > lastLedger
       ? tipLedger - lastLedger
       : null
-    const estimatedLagSeconds = ledgersBehind != null ? ledgersBehind * 5 : null
+    // Issue #139: same derivation as /ready — a named, configurable constant
+    // rather than a bare literal that could silently drift from it.
+    const estimatedLagSeconds = ledgersBehind != null
+      ? ledgersBehind * config.stellar.ledgerCloseTimeSeconds
+      : null
+
+    let contracts: DAOStats['contracts']
+    if (config.stellar.contractIds.length > 1) {
+      // Issue #506: the per-contract cursor/halt reads live in one shared
+      // helper so /api/contracts and /api/stats cannot drift apart. Only the
+      // fields that were already part of /api/stats are mapped here — the
+      // helper's extra staleness fields are used by the new endpoint.
+      const health = await loadContractCursorHealth(config.stellar.contractIds)
+      contracts = Object.fromEntries(Object.values(health).map((contract) => [
+        contract.contractId,
+        {
+          lastIndexedLedger: contract.lastIndexedLedger,
+          observedTipLedger: contract.observedTipLedger,
+          ledgersBehind: contract.ledgersBehind,
+          quarantinedEvents: contract.quarantinedEvents,
+          quarantineEscalatedAt: contract.quarantineEscalatedAt,
+          reorgDetected: contract.reorgDetected,
+        },
+      ]))
+    }
 
     return {
       totalMembers: Number(row?.total_members ?? 0),
@@ -721,25 +1868,89 @@ export async function registerRoutes(app: FastifyInstance, opts: { nonceStore: N
       totalDefaultedValue: String(row?.total_defaulted_value ?? '0'),
       totalTreasuryProposals: Number(row?.total_treasury_proposals ?? 0),
       totalStaked: String(row?.total_staked ?? '0'),
+      totalContribution: String(row?.total_contribution ?? '0'),
+      // Issue #281: guard the zero-contribution case explicitly rather than
+      // relying on Number(0n)/Number(0n) — that's NaN, which would silently
+      // become `null` over JSON and break any dashboard doing arithmetic on it.
+      stakingRatio: (() => {
+        const staked = BigInt(row?.total_staked ?? '0')
+        const contribution = BigInt(row?.total_contribution ?? '0')
+        return contribution === 0n ? 0 : Number(staked) / Number(contribution)
+      })(),
       interestCollected: String(row?.interest_collected ?? '0'),
       principalLent: String(row?.principal_lent ?? '0'),
       principalRepaid: String(row?.principal_repaid ?? '0'),
       valueDefaulted: String(row?.value_defaulted ?? '0'),
       quarantinedEvents: Number(row?.quarantined_events ?? 0),
+      quarantineEscalatedAt: row?.quarantine_escalated_at ?? null,
       lastIndexedLedger: lastLedger,
       observedTipLedger: tipLedger,
       ledgersBehind,
       estimatedLagSeconds,
       secondsSinceUpdate,
       indexerStale: isStale,
+      // Issue #191: a recorded, uncleared ledger discontinuity. Distinct from
+      // `indexerStale` — the worker halted on purpose and refuses to resume
+      // until an operator clears it (see docs/REORG_RECOVERY.md).
+      reorgDetected: row?.reorg_detected_at != null,
+      reorgHalt: row?.reorg_detected_at != null
+        ? {
+          detectedAt: new Date(row.reorg_detected_at).toISOString(),
+          contractId: row.reorg_contract_id ?? '',
+          lastLedger: row.reorg_last_ledger ?? null,
+          detail: row.reorg_detail ?? '',
+        }
+        : null,
+      ...(contracts === undefined ? {} : { contracts }),
+      // Issue #156: live SSE connection count for this process.
+      connectedStreams: getConnectedStreamCount(),
+      // Issue #169: NOTIFY failures since process start — in-process only,
+      // same caveat as connectedStreams above.
+      notificationFailures: getNotificationFailureCount(),
     }
   }
 
   app.get('/stats', async (req, reply): Promise<DAOStats> => {
     const ttl = config.http.statsCacheMs
-    reply.header('Cache-Control', `public, max-age=${Math.max(0, Math.floor(ttl / 1000))}`)
+    setCachePolicy(reply, 'public-live')
+    // Issue #156 / #382: connectedStreams and notificationFailures are live
+    // process state — always refresh them even when the rest of the stats
+    // payload is served from the short cache.
+    const live = {
+      connectedStreams: getConnectedStreamCount(),
+      notificationFailures: getNotificationFailureCount(),
+    }
     if (statsCache && Date.now() - statsCache.at < ttl) {
-      return statsCache.value
+      return { ...statsCache.value, ...live }
+    }
+
+    // Stats is an aggregate over several tables and is the only request type
+    // allowed to be shed. A cache miss never waits behind another expensive
+    // recomputation: preserving ordinary reads is more useful than making a
+    // dashboard poll queue until the request pool is exhausted.
+    try {
+      return await statsGate.run(async () => {
+        try {
+          const value = await computeStats()
+          statsCache = { at: Date.now(), value }
+          return { ...value, connectedStreams: live.connectedStreams }
+        } catch (err) {
+          // A successful prior value remains useful during a transient database
+          // failure. Surface that it is stale while retaining the normal shape.
+          if (statsCache) {
+            app.log.warn({ err }, 'stats recompute failed; serving stale cached value')
+            reply.header('X-Data-Stale', 'true')
+            return { ...statsCache.value, connectedStreams: live.connectedStreams }
+          }
+          throw err
+        }
+      })
+    } catch (err) {
+      if (err instanceof ConcurrencyLimitError) {
+        reply.header('Retry-After', String(config.http.statsRetryAfterSeconds))
+        return reply.code(503).send({ error: 'stats temporarily unavailable; retry shortly' })
+      }
+      throw err
     }
     const value = await computeStats(requestSpan(req))
     statsCache = { at: Date.now(), value }

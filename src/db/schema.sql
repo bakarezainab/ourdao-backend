@@ -19,25 +19,31 @@ CREATE TABLE IF NOT EXISTS schema_migrations (
   applied_at TIMESTAMPTZ NOT NULL DEFAULT now()
 );
 
--- Indexer resume state (single row, id = 1).
--- `last_ledger_hash` is the ledger-hash of the RPC's reported tip at the time
--- the cursor was last advanced (Soroban getEvents exposes no per-event hash);
--- it is forensic context for a detected discontinuity, not a verified
--- processed-ledger hash. See issue #23 / README "Reorg detection".
+-- Indexer resume state — one row per tailed contract, primary-keyed on
+-- contract_id (issue #289: multi-contract tailing needs an independent
+-- cursor per contract; a pre-#289 single-contract deployment just has one
+-- row here). `id` survives only as a vestigial nullable column so any
+-- database that predates #289 doesn't need it dropped by hand; it's never
+-- read or written by current code.
+-- `last_ledger_hash` is the hash of `last_ledger` itself — the ledger
+-- actually folded to (issue #127) — fetched by sequence from the RPC
+-- (Soroban getEvents exposes no per-event hash). Re-checked against the
+-- RPC's current hash for that same sequence on every poll to catch a
+-- same-height fork the sequence-only continuity check can't see (issue
+-- #128). See README "Reorg detection".
 -- `observed_tip_ledger` (issue #45) is the RPC's most recently observed chain
 -- tip — freshness/reporting only, distinct from `last_ledger` (the highest
 -- ledger actually folded, which the reorg continuity check uses). An empty
 -- getEvents page must never advance `last_ledger` from this value; see
 -- README "Reorg detection" and src/indexer/poller.ts.
 CREATE TABLE IF NOT EXISTS indexer_cursor (
-  id                  SMALLINT PRIMARY KEY DEFAULT 1,
+  id                  SMALLINT,
   paging_token        TEXT,
   last_ledger         BIGINT,
   last_ledger_hash    TEXT,
   observed_tip_ledger BIGINT,
-  contract_id         TEXT,
-  updated_at          TIMESTAMPTZ NOT NULL DEFAULT now(),
-  CONSTRAINT indexer_cursor_singleton CHECK (id = 1)
+  contract_id         TEXT PRIMARY KEY,
+  updated_at          TIMESTAMPTZ NOT NULL DEFAULT now()
 );
 
 -- Raw event log — the append-only source every derived table is built from.
@@ -50,7 +56,16 @@ CREATE TABLE IF NOT EXISTS events (
   topics      JSONB NOT NULL,
   data        JSONB NOT NULL,
   tx_hash     TEXT,
-  created_at  TIMESTAMPTZ NOT NULL DEFAULT now()
+  decode_error TEXT,
+  created_at  TIMESTAMPTZ NOT NULL DEFAULT now(),
+  -- Set when this event's derived-state fold has committed — independent of
+  -- the row's own existence, so a crash between the raw insert and the fold
+  -- (quarantine path) can be detected and retried rather than silently
+  -- skipped (issue #119). Declared last, matching where the
+  -- 0016_events_folded_at.sql ALTER TABLE physically appends it on a
+  -- database that already had this table (schema.sql's own column order
+  -- only governs a truly fresh bootstrap).
+  folded_at   TIMESTAMPTZ
 );
 CREATE INDEX IF NOT EXISTS events_symbol_idx ON events (symbol);
 CREATE INDEX IF NOT EXISTS events_ledger_idx ON events (ledger);
@@ -69,6 +84,7 @@ CREATE INDEX IF NOT EXISTS events_entity_id_idx ON events ((data->>0));
 -- Supports `GET /api/members/:address/activity`, which matches an address in
 -- any position of the `data` tuple with JSONB containment (`data @> '"G…"'`).
 CREATE INDEX IF NOT EXISTS events_data_gin_idx ON events USING GIN (data jsonb_path_ops);
+CREATE INDEX IF NOT EXISTS events_ledger_id_idx ON events (ledger, id);
 
 CREATE TABLE IF NOT EXISTS members (
   address         TEXT PRIMARY KEY,
@@ -88,6 +104,17 @@ CREATE TABLE IF NOT EXISTS members (
 -- non-exited rows, so `count(*) ... WHERE exited = false` is an index-only
 -- scan over the small live set rather than a seq scan of every member ever.
 CREATE INDEX IF NOT EXISTS members_active_idx ON members (address) WHERE exited = false;
+-- Supports GET /api/members' `ORDER BY joined_ledger DESC NULLS LAST` over
+-- the same active-member filter (issue #607) -- members_active_idx above is
+-- keyed on `address`, not `joined_ledger`, so it can't serve this sort.
+-- NULLS LAST is explicit: see migrations/0034 for why a DESC index's default
+-- null-ordering would otherwise defeat the planner's pathkey match. Not a
+-- replacement for members_active_idx, which still serves the broader
+-- `WHERE exited = false` (no `joined_ledger` filter) aggregates in
+-- /api/stats that this narrower partial index can't satisfy.
+CREATE INDEX IF NOT EXISTS members_active_joined_ledger_idx
+  ON members (joined_ledger DESC NULLS LAST)
+  WHERE exited = false AND joined_ledger IS NOT NULL;
 
 -- `votes_for`/`votes_against` hold stake-weighted voting power (see the
 -- Event catalog section of the README), which can exceed what INTEGER was
@@ -100,7 +127,7 @@ CREATE TABLE IF NOT EXISTS loan_proposals (
   total_repayment NUMERIC(40,0) NOT NULL DEFAULT 0,
   status          TEXT NOT NULL DEFAULT 'pending'
                   CONSTRAINT loan_proposals_status_check
-                  CHECK (status IN ('pending', 'approved', 'rejected', 'cancelled')),
+                  CHECK (status IN ('pending', 'approved', 'rejected', 'cancelled', 'approved_pending_disbursement')),
   votes_for       NUMERIC(40,0) NOT NULL DEFAULT 0,
   votes_against   NUMERIC(40,0) NOT NULL DEFAULT 0,
   voter_count     INTEGER NOT NULL DEFAULT 0,
@@ -108,6 +135,9 @@ CREATE TABLE IF NOT EXISTS loan_proposals (
   updated_at      TIMESTAMPTZ NOT NULL DEFAULT now()
 );
 CREATE INDEX IF NOT EXISTS loan_proposals_borrower_idx ON loan_proposals (borrower);
+-- Supports the ?status= filter on GET /api/proposals/loan (issue #605),
+-- matching loans_status_idx below. See docs/proposal-status-query-plan.md.
+CREATE INDEX IF NOT EXISTS loan_proposals_status_idx ON loan_proposals (status);
 
 -- `id` doubles as the originating loan_proposals.id: the contract reuses the
 -- proposal's own id for the disbursed loan (see ourdao-contracts'
@@ -138,7 +168,7 @@ CREATE TABLE IF NOT EXISTS treasury_proposals (
   private         BOOLEAN NOT NULL DEFAULT false,
   status          TEXT NOT NULL DEFAULT 'pending'
                   CONSTRAINT treasury_proposals_status_check
-                  CHECK (status IN ('pending', 'executed', 'rejected')),
+                  CHECK (status IN ('pending', 'executed', 'rejected', 'approved_pending_disbursement')),
   votes_for       NUMERIC(40,0) NOT NULL DEFAULT 0,
   votes_against   NUMERIC(40,0) NOT NULL DEFAULT 0,
   voter_count     INTEGER NOT NULL DEFAULT 0,
@@ -146,6 +176,9 @@ CREATE TABLE IF NOT EXISTS treasury_proposals (
   executed_ledger BIGINT,
   updated_at      TIMESTAMPTZ NOT NULL DEFAULT now()
 );
+-- Supports the ?status= filter on GET /api/proposals/treasury (issue #605).
+-- See docs/proposal-status-query-plan.md.
+CREATE INDEX IF NOT EXISTS treasury_proposals_status_idx ON treasury_proposals (status);
 
 CREATE TABLE IF NOT EXISTS notifications (
   id         BIGSERIAL PRIMARY KEY,
@@ -156,9 +189,12 @@ CREATE TABLE IF NOT EXISTS notifications (
   ledger     BIGINT,
   tx_hash    TEXT,
   read       BOOLEAN NOT NULL DEFAULT false,
+  event_id   TEXT,
   created_at TIMESTAMPTZ NOT NULL DEFAULT now()
 );
 CREATE INDEX IF NOT EXISTS notifications_address_idx ON notifications (address, read);
+CREATE INDEX IF NOT EXISTS notifications_event_id_address_idx ON notifications (event_id, address);
+CREATE UNIQUE INDEX IF NOT EXISTS notifications_event_id_address_uniq ON notifications (event_id, address) WHERE event_id IS NOT NULL;
 
 -- Lifetime money aggregates folded from the raw event log (issue #24).
 -- Single row (id = 1). O(1) to read; kept in sync as events fold, and
@@ -175,6 +211,17 @@ CREATE TABLE IF NOT EXISTS dao_totals (
   CONSTRAINT dao_totals_singleton CHECK (id = 1)
 );
 INSERT INTO dao_totals (id) VALUES (1) ON CONFLICT (id) DO NOTHING;
+
+-- Daily loan chart aggregates, updated in the same transaction as each
+-- lifecycle event and rebuilt from the raw event log during reindex.
+CREATE TABLE IF NOT EXISTS daily_loan_stats (
+  day                 DATE PRIMARY KEY,
+  loans_originated    INTEGER NOT NULL DEFAULT 0,
+  principal_lent      NUMERIC(40,0) NOT NULL DEFAULT 0,
+  principal_repaid    NUMERIC(40,0) NOT NULL DEFAULT 0,
+  defaults_count      INTEGER NOT NULL DEFAULT 0,
+  value_defaulted     NUMERIC(40,0) NOT NULL DEFAULT 0
+);
 
 -- One row per `interest` event: the distribution history (issue #24).
 -- `event_id` is the raw events.id and is UNIQUE so a re-delivered event
@@ -195,20 +242,92 @@ CREATE INDEX IF NOT EXISTS interest_distributions_ledger_idx ON interest_distrib
 -- mutated or deleted — this is a separate, additive record of what the
 -- poller gave up on folding and why, so the rest of the page can proceed and
 -- the cursor can advance past it. Not a derived table: never truncated by
--- npm run reindex, since a reindex re-attempts every raw event fresh and
--- either folds it (if the handler's since been fixed) or doesn't touch this
--- table at all (reindex runs applyEvent directly, not the poller's
--- quarantine path).
+-- npm run reindex.
+--
+-- `resolved_at` (issue #168) is set — the row is never deleted, so the
+-- failure history survives — once the event this row refers to has folded
+-- successfully: either a full `npm run reindex` re-applied the whole log
+-- without error (which necessarily re-applied this event too), or a
+-- targeted `npm run replay-failed` (issue #170) re-folded this one record.
+-- NULL means still outstanding; `/api/stats.quarantinedEvents` counts only
+-- those, so the figure means "still a live problem" rather than "ever
+-- happened".
 CREATE TABLE IF NOT EXISTS failed_events (
-  id         BIGSERIAL PRIMARY KEY,
-  event_id   TEXT NOT NULL,
-  symbol     TEXT NOT NULL,
-  ledger     BIGINT NOT NULL,
-  error      TEXT NOT NULL,
-  created_at TIMESTAMPTZ NOT NULL DEFAULT now()
+  id          BIGSERIAL PRIMARY KEY,
+  event_id    TEXT NOT NULL,
+  contract_id TEXT,
+  symbol      TEXT NOT NULL,
+  ledger      BIGINT NOT NULL,
+  error       TEXT NOT NULL,
+  created_at  TIMESTAMPTZ NOT NULL DEFAULT now(),
+  resolved_at TIMESTAMPTZ,
+  -- Why a record was resolved and an optional operator note (migration 0026,
+  -- issue #287); nullable so rows resolved by reindex/replay stay valid.
+  resolution  TEXT,
+  resolution_note TEXT
 );
-CREATE INDEX IF NOT EXISTS failed_events_event_id_idx ON failed_events (event_id);
-CREATE INDEX IF NOT EXISTS failed_events_ledger_idx ON failed_events (ledger);
+-- A database bootstrapped before migration 0026 already has the table, so the
+-- CREATE above no-ops; add the columns the same idempotent way the migration does.
+ALTER TABLE failed_events ADD COLUMN IF NOT EXISTS resolution TEXT;
+ALTER TABLE failed_events ADD COLUMN IF NOT EXISTS resolution_note TEXT;
+ALTER TABLE failed_events ADD COLUMN IF NOT EXISTS contract_id TEXT;
+DO $$ BEGIN
+  ALTER TABLE failed_events ADD CONSTRAINT failed_events_resolution_check
+    CHECK (resolution IS NULL OR resolution IN ('resolved', 'ignored'));
+EXCEPTION WHEN duplicate_table OR duplicate_object THEN NULL;
+END $$;
+CREATE INDEX IF NOT EXISTS failed_events_contract_id_idx ON failed_events (contract_id);
+-- One row per distinct failing event (migration 0022, issue #171).
+DO $$ BEGIN
+  ALTER TABLE failed_events ADD CONSTRAINT failed_events_event_id_unique UNIQUE (event_id);
+EXCEPTION WHEN duplicate_table OR duplicate_object THEN NULL;
+END $$;
+CREATE INDEX IF NOT EXISTS failed_events_unresolved_idx ON failed_events (id) WHERE resolved_at IS NULL;
+CREATE INDEX IF NOT EXISTS failed_events_ledger_created_at_idx ON failed_events (ledger, created_at);
+
+CREATE OR REPLACE FUNCTION delete_expired_failed_events() RETURNS void AS $$
+BEGIN
+  DELETE FROM failed_events
+  WHERE resolved_at IS NOT NULL
+    AND created_at < now() - INTERVAL '1 day' * COALESCE(
+      NULLIF(current_setting('app.failed_events_retention_days', true), '')::int,
+      30
+    );
+END;
+$$ LANGUAGE plpgsql;
+
+-- Persistent quarantine escalation state (issues #172, #174, #384); see
+-- migrations/0023_quarantine_state.sql and 0033_multi_contract_quarantine_state.sql.
+-- Keyed per contract_id, not derived: never truncated by npm run reindex.
+CREATE TABLE IF NOT EXISTS quarantine_state (
+  contract_id   TEXT PRIMARY KEY,
+  id            SMALLINT DEFAULT 1,
+  page_key      TEXT,
+  error_message TEXT,
+  failures      INT NOT NULL DEFAULT 1,
+  escalated_at  TIMESTAMPTZ,
+  created_at    TIMESTAMPTZ NOT NULL DEFAULT now(),
+  updated_at    TIMESTAMPTZ NOT NULL DEFAULT now()
+);
+CREATE INDEX IF NOT EXISTS quarantine_state_escalated_at_idx ON quarantine_state (escalated_at);
+
+-- A detected ledger discontinuity (issue #191). One row per halt. The latest
+-- row with `cleared_at IS NULL` stops the worker from resuming (an automatic
+-- restart must not fold past diverged history) and is surfaced by `/ready`
+-- (`reason: reorg_detected`) and `/api/stats.reorgHalt` until an operator
+-- clears it: `npm run reindex` clears it as part of the rebuild, and
+-- `npm run reorg:clear` acknowledges a false alarm without rebuilding.
+CREATE TABLE IF NOT EXISTS reorg_halts (
+  id               BIGSERIAL PRIMARY KEY,
+  contract_id      TEXT NOT NULL,
+  last_ledger      BIGINT,
+  last_ledger_hash TEXT,
+  detail           TEXT NOT NULL,
+  detected_at      TIMESTAMPTZ NOT NULL DEFAULT now(),
+  cleared_at       TIMESTAMPTZ,
+  cleared_by       TEXT
+);
+CREATE INDEX IF NOT EXISTS reorg_halts_uncleared_idx ON reorg_halts (id DESC) WHERE cleared_at IS NULL;
 
 -- One row per `doc_attn` event (issue #44): the existence and history of a
 -- proposal's attached documents, not the content hash itself (that's read
@@ -229,12 +348,57 @@ CREATE TABLE IF NOT EXISTS documents (
   attached_at TIMESTAMPTZ NOT NULL DEFAULT now()
 );
 CREATE INDEX IF NOT EXISTS documents_proposal_idx ON documents (kind, proposal_id, ledger DESC);
+-- Issue #189: unfiltered and per-caller listings (migration 0025).
+CREATE INDEX IF NOT EXISTS documents_caller_idx ON documents (caller, ledger DESC, id DESC);
+CREATE INDEX IF NOT EXISTS documents_ledger_idx ON documents (ledger DESC, id DESC);
 
--- Authentication nonces for Stellar-signed login (issues #63, #66)
+-- Authentication nonces for Stellar-signed login (issues #63, #66, #179, #180)
+-- Keyed on nonce (primary key) with a non-unique index on address to support:
+-- - Multiple outstanding nonces per address (issue #180)
+-- - Atomic nonce issuance without race conditions (issue #179)
+-- - Per-address rate limiting (issue #180)
 CREATE TABLE IF NOT EXISTS auth_nonces (
-  address    TEXT PRIMARY KEY,
-  nonce      TEXT NOT NULL,
+  nonce      TEXT PRIMARY KEY,
+  address    TEXT NOT NULL,
   expires_at TIMESTAMPTZ NOT NULL,
   created_at TIMESTAMPTZ NOT NULL DEFAULT now()
 );
 CREATE INDEX IF NOT EXISTS auth_nonces_expires_at_idx ON auth_nonces (expires_at);
+CREATE INDEX IF NOT EXISTS auth_nonces_address_idx ON auth_nonces (address);
+
+-- Immutable audit trail for administrative actions (issue #291): resolving
+-- quarantined events, resetting cursors, manual reindexing. Rows are never
+-- updated or deleted — append-only so the trail is tamper-evident.
+-- `admin_address` is the authenticated Stellar address that performed the action.
+-- `action` is a short machine-readable label (e.g. 'resolve_quarantined_event').
+-- `ip_address` is the originating IP as seen by the API (trust level depends on
+--   TRUST_PROXY configuration).
+-- `payload` stores action-specific context as JSONB so the schema is stable as
+--   new action types are added.
+CREATE TABLE IF NOT EXISTS admin_audit_log (
+  id            BIGSERIAL PRIMARY KEY,
+  admin_address TEXT NOT NULL,
+  action        TEXT NOT NULL,
+  ip_address    TEXT,
+  payload       JSONB NOT NULL DEFAULT '{}',
+  created_at    TIMESTAMPTZ NOT NULL DEFAULT now()
+);
+
+-- Issue #608: GET /admin/audit-log pages and sorts by `id`, never
+-- `created_at` -- these are keyed to match that (see migrations/0036 for the
+-- measurement). Superseded the original created_at-keyed composites.
+CREATE INDEX IF NOT EXISTS admin_audit_log_admin_address_id_idx ON admin_audit_log (admin_address, id DESC);
+CREATE INDEX IF NOT EXISTS admin_audit_log_action_id_idx ON admin_audit_log (action, id DESC);
+CREATE INDEX IF NOT EXISTS admin_audit_log_created_at_idx ON admin_audit_log (created_at DESC);
+
+-- Append-only enforcement (migration 0032).
+CREATE OR REPLACE FUNCTION admin_audit_log_immutable() RETURNS trigger AS $$
+BEGIN
+  RAISE EXCEPTION 'admin_audit_log is append-only (% not allowed)', TG_OP;
+END;
+$$ LANGUAGE plpgsql;
+
+DROP TRIGGER IF EXISTS admin_audit_log_no_update_delete ON admin_audit_log;
+CREATE TRIGGER admin_audit_log_no_update_delete
+  BEFORE UPDATE OR DELETE ON admin_audit_log
+  FOR EACH ROW EXECUTE FUNCTION admin_audit_log_immutable();

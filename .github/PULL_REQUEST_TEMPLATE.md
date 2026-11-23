@@ -33,6 +33,8 @@ Closes #<!-- issue number -->
 - [ ] Indexer changes remain resumable from the persisted cursor
 - [ ] No bigint reaches a response body unserialized (still stringified)
 - [ ] Schema changes are additive, or the breaking change is described below
+- [ ] Updated CHANGELOG.md's `[Unreleased]` section (if this is a user-visible change, a migration, or requires an operator action)
+- [ ] Ran `npm run openapi:generate` and committed the updated `openapi.json` (if this adds or changes an API route)
 
 ### Schema changes
 

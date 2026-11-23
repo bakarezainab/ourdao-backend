@@ -2,6 +2,7 @@ import { afterAll, afterEach, beforeEach, describe, expect, it } from 'vitest'
 import type { PoolClient } from 'pg'
 import { pool, query } from '../src/db/index.js'
 import { applyEvent } from '../src/indexer/handlers.js'
+import { STREAM_CHANNELS } from '../src/api/stream.js'
 import { closeDb, resetDb } from './db.js'
 import { decodedEvent } from './fixtures.js'
 import type { MemberRow, NotificationRow, TreasuryProposalRow } from '../src/types.js'
@@ -54,13 +55,67 @@ describe('indexer handlers: treasury', () => {
     expect(rows[0]?.voter_count).toBe(2)
   })
 
+  it('tre_wait marks the proposal approved_pending_disbursement and notifies the destination (issue #125)', async () => {
+    await applyEvent(
+      client,
+      decodedEvent('tre_prop', { id: 30, amount: '5000', destination: 'GDEST', private: false })
+    )
+    await applyEvent(client, decodedEvent('tre_wait', { id: 30, amount: '5000' }))
+
+    const rows = await query<TreasuryProposalRow>('SELECT * FROM treasury_proposals WHERE id = 30')
+    expect(rows[0]?.status).toBe('approved_pending_disbursement')
+
+    const notifs = await query<NotificationRow>('SELECT * FROM notifications WHERE address = $1', ['GDEST'])
+    expect(notifs.map((n) => n.title)).toContain('Treasury withdrawal approved, awaiting funds')
+  })
+
+  it('a later tre_exec resolves an approved_pending_disbursement proposal (issue #125)', async () => {
+    await applyEvent(
+      client,
+      decodedEvent('tre_prop', { id: 31, amount: '5000', destination: 'GDEST', private: false })
+    )
+    await applyEvent(client, decodedEvent('tre_wait', { id: 31, amount: '5000' }))
+    await applyEvent(client, decodedEvent('tre_exec', { id: 31, amount: '5000', destination: 'GDEST' }))
+
+    const rows = await query<TreasuryProposalRow>('SELECT * FROM treasury_proposals WHERE id = 31')
+    expect(rows[0]?.status).toBe('executed')
+  })
+
+  it('tre_rej marks the proposal rejected and notifies the destination (issue #124)', async () => {
+    await applyEvent(
+      client,
+      decodedEvent('tre_prop', { id: 32, amount: '5000', destination: 'GDEST', private: false })
+    )
+    await applyEvent(client, decodedEvent('tre_rej', { id: 32, for_votes: '1', against_votes: '4' }))
+
+    const rows = await query<TreasuryProposalRow>('SELECT * FROM treasury_proposals WHERE id = 32')
+    expect(rows[0]?.status).toBe('rejected')
+
+    const notifs = await query<NotificationRow>('SELECT * FROM notifications WHERE address = $1', ['GDEST'])
+    expect(notifs.map((n) => n.title)).toContain('Treasury proposal rejected')
+  })
+
+  it('re-delivering tre_rej is idempotent', async () => {
+    await applyEvent(
+      client,
+      decodedEvent('tre_prop', { id: 33, amount: '5000', destination: 'GDEST', private: false })
+    )
+    const rejEv = decodedEvent('tre_rej', { id: 33, for_votes: '1', against_votes: '4' })
+    await applyEvent(client, rejEv)
+    await applyEvent(client, rejEv)
+
+    const notifs = await query<NotificationRow>('SELECT * FROM notifications WHERE address = $1', ['GDEST'])
+    expect(notifs).toHaveLength(1)
+  })
+
   it('tre_exec marks the proposal executed and notifies the destination', async () => {
     await applyEvent(
       client,
       decodedEvent('tre_prop', { id: 3, amount: '5000', destination: 'GDEST', private: false })
     )
     const execEv = decodedEvent('tre_exec', { id: 3, amount: '5000', destination: 'GDEST' })
-    await applyEvent(client, execEv)
+    const ch = await applyEvent(client, execEv)
+    expect(ch).toBe(STREAM_CHANNELS.treasury_proposals)
 
     const rows = await query<TreasuryProposalRow>('SELECT * FROM treasury_proposals WHERE id = 3')
     expect(rows[0]?.status).toBe('executed')
@@ -75,7 +130,8 @@ describe('indexer handlers: treasury', () => {
       client,
       decodedEvent('tre_prop', { id: 4, amount: '5000', destination: 'GDEST', private: true })
     )
-    await applyEvent(client, decodedEvent('revealed', { proposal_id: 4, voter: 'GV1', support: true }))
+    const ch = await applyEvent(client, decodedEvent('revealed', { proposal_id: 4, voter: 'GV1', support: true }))
+    expect(ch).toBe(STREAM_CHANNELS.treasury_proposals)
 
     const rows = await query<TreasuryProposalRow>('SELECT * FROM treasury_proposals WHERE id = 4')
     expect(rows[0]?.votes_for).toBe('1')
@@ -140,7 +196,8 @@ describe('indexer handlers: registry', () => {
 
   it('name_reg sets the name on an existing member', async () => {
     await applyEvent(client, decodedEvent('joined', { member: 'GALICE', fee: '10' }))
-    await applyEvent(client, decodedEvent('name_reg', { name: 'alice.our', owner: 'GALICE' }))
+    const ch = await applyEvent(client, decodedEvent('name_reg', { name: 'alice.our', owner: 'GALICE' }))
+    expect(ch).toBe(STREAM_CHANNELS.members)
     const rows = await query<MemberRow>('SELECT * FROM members WHERE address = $1', ['GALICE'])
     expect(rows[0]?.name).toBe('alice.our')
   })

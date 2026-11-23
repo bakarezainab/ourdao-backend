@@ -58,7 +58,14 @@ npm run build
 TEST_DATABASE_URL=postgres://ourdao:ourdao@localhost:5432/ourdao_test npm test
 ```
 
+Each parallel test worker uses its own `test_worker_N` schema and drops it on a clean exit. If a run is killed mid-suite (Ctrl-C, a crashed process), those schemas are left behind. Once no test run is in progress, remove them with `npm run clean:test-schemas`, pointed at the same database (`DATABASE_URL=$TEST_DATABASE_URL npm run clean:test-schemas`).
+
 CI provisions a throwaway `ourdao_test` database as a service container and does exactly this.
+
+Two more checks CI runs that aren't in the list above:
+
+- **`npm run test:coverage`** produces a per-file coverage report and enforces the thresholds in `vitest.config.ts`. A change that drops coverage below the floor fails CI. The thresholds ratchet — raise them when you can, don't lower them to pass.
+- **The Docker image is built and smoke-tested** in a separate `docker-build` job (it starts the image against a real Postgres and checks `/health`). The most common way to break it: add a migration and forget that `npm run build` must copy `src/db/schema.sql` and `src/db/migrations/` into `dist/` — the image then starts and fails at runtime. The `build` script already does the copy; don't remove it.
 
 ## What a good pull request looks like
 
@@ -66,19 +73,48 @@ CI provisions a throwaway `ourdao_test` database as a service container and does
 - **It includes a test that would fail without your change.** For a bug fix, that means a regression test that reproduces the bug. "The existing tests still pass" is the floor, not the bar.
 - **Its tests hit a real database, not a mock.** Follow the pattern in the existing suites.
 - **It doesn't reformat code you didn't change.**
-- **Its description explains why, not just what.**
+- **Its description explains why, not just what.** Implementation summary and completion status belong in the PR description on GitHub, not in committed files — write the narrative there instead (see issue #185).
+- **It updates CHANGELOG.md for user-visible changes.** Any pull request that alters an API response, adds or alters a route, introduces a database migration, or requires an operator action (e.g. reindex) must include an entry under the `[Unreleased]` section of [CHANGELOG.md](./CHANGELOG.md), explicitly marking `[Migration: <file>]` or `[Requires Reindex]` as applicable.
 - **CI is green** before you request review.
+- **Pull requests require review from code owners.** Changes to `src/indexer/`, `src/auth.ts`, and `src/db/migrations/` have stricter review requirements enforced by GitHub's CODEOWNERS file. Wait for the required review before merging.
+- **If you add or change API routes, regenerate the OpenAPI spec.** Run `npm run openapi:generate` and commit the updated `openapi.json`. CI will fail if the committed spec doesn't match what the routes produce.
 
 ## Backend-specific rules
 
+### Preserve the API contract
+
+Read [the API compatibility policy](./docs/API_COMPATIBILITY.md) before
+changing a route. `/api` is additive-only: removing or renaming fields,
+changing JSON types or established status codes, tightening accepted input,
+and changing authentication are breaking changes and require a versioned
+path. Consumer-facing changes must link the corresponding
+`ourdao-frontend` issue or pull request so reviewers can verify rollout order.
+
+- **Error codes are append-only.** Every error response carries a stable `code` from `ERROR_CODES` in `src/api/errors.ts`, and clients branch on it. Treat the list the way `ourdao-contracts` treats its error variants: never rename, remove or repurpose a code — add a new one, and document it in the README's Errors table (`test/api-error-envelope.test.ts` fails on an undocumented code). A route that returns a deliberate error just sends `{ error }` with the right status; the status-derived `code` and `correlationId` are added for it.
 - **This service is strictly read-only with respect to the chain.** It never holds a private key, never signs, and never submits a transaction. Any pull request that introduces a signing path, a key in config, or an outbound write to the network will be rejected regardless of quality — that's an architectural boundary, not a preference.
 - **The `events` table is append-only.** Raw indexed events are the audit trail. Derived tables (`members`, `loans`, `loan_proposals`, `treasury_proposals`, `notifications`) are rebuilt from it. Don't mutate or delete rows in `events`.
+- **`admin_audit_log` is append-only, enforced by the database.** `src/db/schema.sql` installs a `BEFORE UPDATE OR DELETE` trigger (`admin_audit_log_immutable()`) that rejects any change to an existing row. A wrong audit entry is corrected by inserting a new clarifying row, never by editing the old one, the same way the `events` log is never patched.
 - **Event folding stays transactional.** Writing a raw event and folding it into derived tables happens inside one database transaction so a crash can't leave them inconsistent. New event handlers must preserve that.
 - **Indexer changes must be resumable.** The poll loop resumes from a persisted cursor (`indexer_cursor`), not from genesis. Don't introduce state that only exists in memory across polls.
-- **New contract events need a decoder.** When [`ourdao-contracts`](https://github.com/ourdao/ourdao-contracts) adds an event, `src/stellar/events.ts` needs the matching topic-symbol → data-tuple mapping, and usually a derived-table effect. Note in your PR description which contract commit introduced the event.
+- **New contract events need a decoder.** When [`ourdao-contracts`](https://github.com/ourdao/ourdao-contracts) adds an event, `src/stellar/events.ts` needs the matching topic-symbol → data-tuple mapping, and usually a derived-table effect. Note in your PR description which contract commit introduced the event. An event whose symbol isn't in `EVENT_FIELDS` is still persisted to `events` and still no-ops in the fold — but the indexer now logs one `[events] unknown event symbol …` warning per symbol per process (on the live path and on `npm run reindex` alike). If you see that warning in the logs, the catalog is behind the contract.
+- **Authorization checks use the authenticated address, never a re-parse.** `authenticateRequest` returns a discriminated union — `{ authenticated: false, status, error }` or `{ authenticated: true, address }`. An ownership/authorization check must compare against `auth.address`; never call `extractAuthHeaders` a second time to re-derive identity. Supported wallet address types on the signature-auth endpoints: `G…` (verified directly) and `M…` (resolved to the underlying `G…`). `C…` contract accounts are unsupported and return `400` with an explicit message — not a misleading `401`.
+- **`status` columns are constrained; the value list has one source of truth.** `loan_proposals`, `loans`, and `treasury_proposals` each carry a `CHECK` constraint on `status`. The accepted values are the `as const` arrays in `src/types.ts` (`LOAN_PROPOSAL_STATUSES`, `LOAN_STATUSES`, `TREASURY_PROPOSAL_STATUSES`) — the TypeScript unions are derived from them. To add or change a status value, edit the array, `src/db/schema.sql`, and a numbered migration together; `test/status-constraints.test.ts` fails if the DB constraint and the array drift apart.
+- **Before changing the `events` table's storage shape, measure first.** Run `npm run bench:events` and read [`docs/events-storage.md`](./docs/events-storage.md) — it has the per-row size model, growth per unit of DAO activity, a per-index review, and the concrete threshold at which partitioning is worth its migration cost. A speculative storage change without numbers will be sent back for measurements.
 - **Bigints serialize as strings.** JSON has no native 128-bit integer type. Keep the existing conversion discipline — don't let a raw bigint reach a response body.
 - **`NUMERIC(40,0)` for amounts, `BIGINT` only for sequences.** On-chain `i128` amounts are `NUMERIC(40,0)` and cross the API as strings. Ledger/sequence numbers are `BIGINT` and returned as JSON numbers via a `BIGINT → number` parser scoped to the pool in `src/db/index.ts`. A token amount stored as `BIGINT` would be parsed to a `number` and lose precision above 2⁵³ silently — never do that. See the README's [Database schema](./README.md#database-schema).
 - **Schema changes are additive where possible.** If you must change an existing column, say so explicitly in the PR description, since the schema is applied on boot against existing databases.
+
+### Schema changes
+
+When adding a database migration:
+
+- **Pick a unique, sequential version number.** Migrations are numbered `0001`, `0002`, `0003`, etc. Look at the highest-numbered file in `src/db/migrations/` and use the next integer. Two migrations with the same version will conflict — `schema_migrations.version` is a primary key, so only one will ever be recorded.
+- **Name the file `<version>_<description>.sql`.** For example, `0015_add_member_email.sql`. The version is parsed from the filename prefix and must match the pattern `^\d+_.*\.sql$`.
+- **Update `src/db/schema.sql` in the same PR.** `schema.sql` is the bootstrap baseline for fresh databases — it describes the *current* desired state after all migrations. Your migration applies the change to an *existing* database; `schema.sql` applies it to a *new* one. If you only add the migration file, a fresh database built from `schema.sql` won't have your change, because `CREATE TABLE IF NOT EXISTS` silently no-ops when the table already exists. The test suite builds from `schema.sql` alone, so a migration-only change is untested.
+- **The fresh-database shortcut:** when `migrate()` runs against a database with no prior migrations (`schema_migrations` is empty), it records all migration files as applied without re-running their SQL. This is safe because `schema.sql` just created the end state directly. The SQL in your migration file is only executed against databases that predate it.
+- **Manual verification required.** The test suite does not exercise migrations — it applies `schema.sql` to a fresh database and truncates tables between tests. A migration needs manual verification against a pre-existing database to confirm the `ALTER` statement works as expected.
+
+See the README's [Database schema](./README.md#database-schema) section for the full picture of how `schema.sql` and `migrations/` work together.
 
 ## What gets closed without review
 
@@ -91,9 +127,7 @@ CI provisions a throwaway `ourdao_test` database as a service container and does
 
 ## Reporting a security issue
 
-**Do not open a public issue for a security vulnerability.** Use GitHub's [private vulnerability reporting](https://docs.github.com/en/code-security/security-advisories/guidance-on-reporting-and-writing-information-about-vulnerabilities/privately-reporting-a-security-vulnerability) on this repository.
-
-Include what you found, how to reproduce it, and what an attacker could do with it.
+**Do not open a public issue for a security vulnerability.** See [SECURITY.md](./SECURITY.md) for how to report one (GitHub's private vulnerability reporting) and what to include.
 
 ## License
 

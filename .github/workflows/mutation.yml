@@ -1,0 +1,71 @@
+name: Mutation Testing
+
+permissions:
+  contents: read
+
+# Scheduled and manual dispatch only (#209).
+# Mutation testing against the real Postgres database is computationally
+# intensive and must serialize test runs (concurrency: 1) to prevent resetDb()
+# TRUNCATE races. Running on per-PR CI would introduce 15-30m build delays.
+on:
+  schedule:
+    - cron: '0 3 * * 1' # Weekly at 03:00 UTC on Mondays
+  workflow_dispatch:
+
+# A manual re-run must never race the Monday scheduled run against the same
+# serialized (concurrency: 1), resource-sensitive Stryker suite — queue it
+# instead of cancelling the run already in progress (issue #211's fix for
+# ci.yml, applied here).
+concurrency:
+  group: ${{ github.workflow }}
+  cancel-in-progress: false
+
+jobs:
+  mutation-test:
+    runs-on: ubuntu-latest
+    # Generous bound while real run durations are collected (recent scheduled
+    # runs have failed before reaching Stryker, so no baseline exists yet);
+    # tighten once a few full runs land. Caps a wedged run instead of tying
+    # up a scheduled runner slot indefinitely.
+    timeout-minutes: 90
+
+    services:
+      postgres:
+        image: postgres:16-alpine
+        env:
+          POSTGRES_USER: ourdao
+          POSTGRES_PASSWORD: ourdao
+          POSTGRES_DB: ourdao_test
+        ports:
+          - 5432:5432
+        options: >-
+          --health-cmd "pg_isready -U ourdao"
+          --health-interval 5s
+          --health-timeout 5s
+          --health-retries 5
+
+    env:
+      TEST_DATABASE_URL: postgres://ourdao:ourdao@localhost:5432/ourdao_test
+
+    steps:
+      - uses: actions/checkout@d632683dd7b4114ad314bca15554477dd762a938 # v4.2.0
+
+      - uses: actions/setup-node@60edb5dd545a775178f52524783378180af0d1f8 # v4.0.2
+        with:
+          node-version: 22
+          cache: npm
+
+      - name: Install dependencies
+        run: npm ci
+
+      # Issue #349: no continue-on-error — a failing or missing Stryker run must
+      # fail the job instead of showing a green check that proves nothing.
+      - name: Run mutation testing (Stryker)
+        run: npx stryker run
+
+      - name: Upload mutation report
+        uses: actions/upload-artifact@5d5d22a31266ced268874388b861e4b58bb5c2f3 # v4.3.1
+        if: always()
+        with:
+          name: mutation-report
+          path: reports/mutation/

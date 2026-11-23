@@ -1,14 +1,26 @@
 name: CI
 
+permissions:
+  contents: read
+  actions: read
+
 on:
   push:
     branches: [main]
   pull_request:
     branches: [main]
 
+concurrency:
+  group: ${{ github.workflow }}-${{ github.event_name == 'pull_request' && github.head_ref || github.ref }}
+  cancel-in-progress: ${{ github.event_name == 'pull_request' }}
+
 jobs:
   build-and-test:
     runs-on: ubuntu-latest
+    timeout-minutes: 20
+    strategy:
+      matrix:
+        node-version: [22, 24]
 
     services:
       postgres:
@@ -29,15 +41,22 @@ jobs:
       TEST_DATABASE_URL: postgres://ourdao:ourdao@localhost:5432/ourdao_test
 
     steps:
-      - uses: actions/checkout@v4
-
-      - uses: actions/setup-node@v4
+      - uses: actions/checkout@d632683dd7b4114ad314bca15554477dd762a938 # v4.2.0
         with:
-          node-version: 20
+          # Issue #591: full history on PR runs so check-dependency-description
+          # can `git show` package.json at both the base and head commits.
+          fetch-depth: ${{ github.event_name == 'pull_request' && 0 || 1 }}
+
+      - uses: actions/setup-node@60edb5dd545a775178f52524783378180af0d1f8 # v4.0.2
+        with:
+          node-version: ${{ matrix.node-version }}
           cache: npm
 
       - name: Install dependencies
         run: npm ci
+
+      - name: Audit dependencies
+        run: npm audit --audit-level=high
 
       - name: Lint
         run: npm run lint
@@ -47,6 +66,12 @@ jobs:
 
       - name: Schema drift audit
         run: npm run audit:schema-drift
+
+      # Issue #537: catch a new migration that jumps version numbers or fills
+      # a deliberate gap before merge, complementing the runtime duplicate-
+      # version check in src/db/migrate.ts's assertNoDuplicateVersions.
+      - name: Migration version sequence check
+        run: npm run check:migrations
 
       # Runs the full suite with v8 coverage instrumentation and enforces the
       # thresholds in vitest.config.ts (#79). Replaces the plain `npm test`
@@ -62,12 +87,65 @@ jobs:
             {
               echo '### Coverage'
               echo ''
+              echo '#### Overall'
+              echo ''
               echo '| metric | % | covered / total |'
               echo '| --- | --- | --- |'
               node -e '
                 const t = require("./coverage/coverage-summary.json").total;
                 for (const k of ["lines","statements","functions","branches"])
                   console.log(`| ${k} | ${t[k].pct}% | ${t[k].covered} / ${t[k].total} |`);
+              '
+              echo ''
+              echo '#### Per-Module Coverage (issue #208)'
+              echo ''
+              echo '| module | lines | functions | branches | statements |'
+              echo '| --- | --- | --- | --- | --- |'
+              node -e '
+                const summary = require("./coverage/coverage-summary.json");
+                const modules = {
+                  "src/indexer/": [],
+                  "src/auth.ts": [],
+                  "src/api/": [],
+                  "src/db/": [],
+                  "src/stellar/": [],
+                };
+                
+                // Aggregate coverage by module
+                for (const [file, data] of Object.entries(summary)) {
+                  if (file === "total") continue;
+                  
+                  for (const [module, files] of Object.entries(modules)) {
+                    if (file.includes(module)) {
+                      files.push(data);
+                      break;
+                    }
+                  }
+                }
+                
+                // Calculate and print per-module totals
+                for (const [module, files] of Object.entries(modules)) {
+                  if (files.length === 0) continue;
+                  
+                  const totals = { lines: {covered:0, total:0}, functions: {covered:0, total:0},
+                                   branches: {covered:0, total:0}, statements: {covered:0, total:0} };
+                  
+                  for (const file of files) {
+                    for (const metric of ["lines", "functions", "branches", "statements"]) {
+                      totals[metric].covered += file[metric].covered;
+                      totals[metric].total += file[metric].total;
+                    }
+                  }
+                  
+                  const pcts = {};
+                  for (const metric of ["lines", "functions", "branches", "statements"]) {
+                    pcts[metric] = totals[metric].total > 0 
+                      ? ((totals[metric].covered / totals[metric].total) * 100).toFixed(1)
+                      : "0.0";
+                  }
+                  
+                  console.log(`| ${module} | ${pcts.lines}% | ${pcts.functions}% | ${pcts.branches}% | ${pcts.statements}% |`);
+                }
               '
             } >> "$GITHUB_STEP_SUMMARY"
           fi
@@ -80,6 +158,10 @@ jobs:
   # attributable at a glance and doesn't block the source gates.
   docker-build:
     runs-on: ubuntu-latest
+    timeout-minutes: 25
+    permissions:
+      contents: read
+      actions: read
 
     services:
       postgres:
@@ -101,12 +183,12 @@ jobs:
       IMAGE: ourdao-backend:ci
 
     steps:
-      - uses: actions/checkout@v4
+      - uses: actions/checkout@d632683dd7b4114ad314bca15554477dd762a938 # v4.2.0
 
-      - uses: docker/setup-buildx-action@v3
+      - uses: docker/setup-buildx-action@3d68780484996aa9d417bb9016193885cdf1f299 # v3.6.0
 
       - name: Build image (no push)
-        uses: docker/build-push-action@v6
+        uses: docker/build-push-action@15560696de535e4014efeff63c48f16952e52dd1 # v6.2.0
         with:
           context: .
           load: true
@@ -116,6 +198,70 @@ jobs:
           build-args: |
             SOURCE_COMMIT=${{ github.sha }}
             BUILD_DATE=${{ github.event.repository.updated_at }}
+          provenance: false
+
+      # Issue #219: SBOM covering base image + npm dependencies. Generated from
+      # the loaded image: buildx SBOM attestations can't be loaded into the
+      # local Docker image store ("docker exporter does not support manifest lists").
+      - name: Generate SBOM
+        uses: aquasecurity/trivy-action@ed142fd0673e97e23eac54620cfb913e5ce36c25 # v0.36.0
+        with:
+          image-ref: ${{ env.IMAGE }}
+          format: 'cyclonedx'
+          output: 'sbom.json'
+
+      - name: Upload SBOM artifact
+        uses: actions/upload-artifact@5d5d22a31266ced268874388b861e4b58bb5c2f3 # v4.3.1
+        with:
+          name: sbom-${{ github.sha }}
+          path: sbom.json
+          retention-days: 90
+
+      # Vulnerability scan (#212): scan the built image with Trivy.
+      # Publishes full findings to GitHub Actions step summary and enforces
+      # a failure policy on HIGH and CRITICAL vulnerabilities.
+      - name: Scan image with Trivy (capture summary)
+        uses: aquasecurity/trivy-action@ed142fd0673e97e23eac54620cfb913e5ce36c25 # v0.36.0
+        with:
+          image-ref: ${{ env.IMAGE }}
+          format: 'table'
+          output: 'trivy-results.txt'
+          severity: 'CRITICAL,HIGH'
+          exit-code: '0'
+          trivyignores: '.trivyignore'
+
+      - name: Publish vulnerability scan results to summary
+        if: always()
+        run: |
+          if [ -f trivy-results.txt ]; then
+            {
+              echo '### Container Vulnerability Scan (Trivy)'
+              echo ''
+              echo '```text'
+              cat trivy-results.txt
+              echo '```'
+            } >> "$GITHUB_STEP_SUMMARY"
+          fi
+
+      - name: Enforce vulnerability policy (fail on HIGH/CRITICAL)
+        uses: aquasecurity/trivy-action@ed142fd0673e97e23eac54620cfb913e5ce36c25 # v0.36.0
+        with:
+          image-ref: ${{ env.IMAGE }}
+          format: 'table'
+          severity: 'CRITICAL,HIGH'
+          exit-code: '1'
+          ignore-unfixed: false
+          trivyignores: '.trivyignore'
+
+      - name: Enforce vulnerability policy (fail on CRITICAL)
+        uses: aquasecurity/trivy-action@ed142fd0673e97e23eac54620cfb913e5ce36c25 # v0.36.0
+        with:
+          image-ref: ${{ env.IMAGE }}
+          format: 'table'
+          severity: 'CRITICAL'
+          exit-code: '1'
+          ignore-unfixed: false
+          trivyignores: '.trivyignore'
 
       # The `cp src/db/schema.sql … && cp -r src/db/migrations …` build step is
       # the failure most likely to reach production silently: add a migration,
@@ -157,26 +303,97 @@ jobs:
           docker run -d --name api --network host \
             --health-interval=3s --health-start-period=3s --health-retries=10 \
             -e DATABASE_URL="$DB_URL" -e PORT=4000 -e CONTRACT_ID=CTEST "$IMAGE"
+          status=starting
           for _ in $(seq 1 40); do
             s="$(docker inspect -f '{{.State.Health.Status}}' api)"
-            [ "$s" = healthy ] && break
-            [ "$s" = unhealthy ] && break
+            [ "$s" = healthy ] && { status=healthy; break; }
+            [ "$s" = unhealthy ] && { status=unhealthy; break; }
             sleep 2
           done
           echo "--- api logs ---"; docker logs api
           curl -fsS -o /dev/null -w 'GET /health -> %{http_code}\n' http://localhost:4000/health
+          test "$status" = healthy
+
+      # Issue #602: /health deliberately does no database round trip (see the
+      # comment above), so a container that boots and answers /health has not
+      # proven that /ready — the probe docs/DEPLOYMENT.md tells operators to
+      # use as the load-balancer readiness check instead — works inside this
+      # same image, with the real runtime dependency tree (`npm ci
+      # --omit=dev`) installed. Reuses the `api` container already running
+      # against this job's Postgres service container, migrated by
+      # src/index.ts's `await migrate()` before it started listening.
+      - name: GET /ready reports ready against the migrated database
+        run: |
+          body="$(curl -fsS -w '\n%{http_code}' http://localhost:4000/ready)"
+          code="$(echo "$body" | tail -n1)"
+          json="$(echo "$body" | sed '$d')"
+          echo "GET /ready -> $code"
+          echo "$json"
           docker rm -f api >/dev/null
-          test "$s" = healthy
+          test "$code" = 200
+          test "$(echo "$json" | jq -r .status)" = ready
+          # A cold-start empty database legitimately answers 'cold_start'
+          # (no indexer has run against this image) — don't require a
+          # fully-caught-up indexer, only that the shape matches what
+          # README/docs/DEPLOYMENT.md document.
+          indexer="$(echo "$json" | jq -r .indexer)"
+          case "$indexer" in
+            cold_start)
+              test "$(echo "$json" | jq -r .lastIndexedLedger)" = null
+              ;;
+            ok)
+              echo "$json" | jq -e '.lastIndexedLedger | type == "number"' >/dev/null
+              ;;
+            *)
+              echo "unexpected /ready indexer value: $indexer" >&2
+              exit 1
+              ;;
+          esac
 
       - name: worker entrypoint boots and exits 0 on SIGTERM
         run: |
           docker run -d --name worker --network host \
             -e DATABASE_URL="$DB_URL" -e CONTRACT_ID=CTEST \
             "$IMAGE" node dist/worker.js
-          sleep 10
+          # Bound startup observation independently of the job timeout.
+          for _ in $(seq 1 10); do
+            docker inspect -f '{{.State.Running}}' worker | grep -qx true || break
+            sleep 1
+          done
           echo "--- worker logs ---"; docker logs worker
+          docker inspect -f '{{.State.Running}}' worker | grep -qx true
           docker stop -t 15 worker
           code="$(docker inspect -f '{{.State.ExitCode}}' worker)"
           echo "worker exit code: $code"
           docker rm -f worker >/dev/null
           test "$code" = 0
+
+      # Issue #581: the API and worker entrypoints above are smoke-tested
+      # inside this built image, but `node dist/indexer/reindex.js` — the
+      # documented recovery path for a detected reorg and for quarantined-
+      # event repair (docs/REORG_RECOVERY.md, docs/DEPLOYMENT.md's "Backup
+      # and recovery") — never was. Reuses this job's existing Postgres
+      # service and DB_URL, already migrated by the API step above, and
+      # seeds one raw `joined` event so the run has something real to fold.
+      - name: node dist/indexer/reindex.js rebuilds derived tables from the event log
+        run: |
+          set -e
+          psql "$DB_URL" -c "
+            INSERT INTO events (id, ledger, closed_at, contract_id, symbol, topics, data, tx_hash)
+            VALUES (
+              'reindex-smoke-0000000001', 900000, now(), 'CTEST', 'joined',
+              '[\"joined\"]'::jsonb,
+              '[\"GREINDEXSMOKETESTMEMBERADDRESS0000000000000\", \"1000\"]'::jsonb,
+              'reindex-smoke-tx'
+            )
+          "
+          docker run --rm --network host \
+            -e DATABASE_URL="$DB_URL" -e CONTRACT_ID=CTEST \
+            "$IMAGE" node dist/indexer/reindex.js
+          member_count="$(psql "$DB_URL" -tAc "
+            SELECT count(*) FROM members
+            WHERE address = 'GREINDEXSMOKETESTMEMBERADDRESS0000000000000'
+              AND contribution = '1000'
+          ")"
+          echo "members row(s) derived from the seeded event: $member_count"
+          test "$member_count" = 1

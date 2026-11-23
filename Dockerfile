@@ -1,7 +1,10 @@
 # syntax=docker/dockerfile:1
 
-# ---- build ----
-FROM node:20-alpine AS build
+# Base image pinned by digest for reproducible builds and SBOM accuracy (issue #219).
+# To update: `docker pull node:22-alpine`, then `docker image inspect node:22-alpine --format '{{.RepoDigests}}'`
+# and use the sha256 digest from the output.
+# Current tag: node:22-alpine (as of 2026-11-21). Matches .node-version; Node 20 is EOL (issue #350).
+FROM node:22-alpine@sha256:1314fb30ec37592d5845e5a160d522c0e680972aa534549940b8d73bde88481a AS build
 WORKDIR /app
 # No `*` glob — a missing lockfile must fail the build, not silently proceed.
 COPY package.json package-lock.json ./
@@ -12,7 +15,7 @@ COPY src ./src
 RUN npm run build
 
 # ---- runtime ----
-FROM node:20-alpine AS runtime
+FROM node:22-alpine@sha256:1314fb30ec37592d5845e5a160d522c0e680972aa534549940b8d73bde88481a AS runtime
 WORKDIR /app
 ENV NODE_ENV=production
 
@@ -20,7 +23,11 @@ ENV NODE_ENV=production
 RUN apk add --no-cache tini
 
 COPY package.json package-lock.json ./
-RUN npm ci --omit=dev
+# npm is needed to install dependencies, but the runtime starts compiled Node
+# entrypoints directly. Remove npm's bundled package tree, which otherwise
+# remains in the image and is scanned as unused production code.
+RUN npm ci --omit=dev \
+    && rm -rf /usr/local/lib/node_modules/npm /usr/local/bin/npm /usr/local/bin/npx
 
 # Copy the built output with `node`-user ownership so the process can read it
 # without running as root.

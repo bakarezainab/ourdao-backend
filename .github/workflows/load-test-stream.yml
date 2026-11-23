@@ -1,0 +1,64 @@
+name: SSE stream load test
+
+on:
+  schedule:
+    - cron: '23 4 * * 0' # Weekly, Sunday 04:23 UTC
+  workflow_dispatch:
+
+permissions:
+  contents: read
+
+jobs:
+  load-test:
+    runs-on: ubuntu-latest
+    timeout-minutes: 15
+    services:
+      postgres:
+        image: postgres:16-alpine
+        env:
+          POSTGRES_USER: ourdao
+          POSTGRES_PASSWORD: ourdao
+          POSTGRES_DB: ourdao_load
+        ports:
+          - 5432:5432
+        options: >-
+          --health-cmd "pg_isready -U ourdao"
+          --health-interval 5s
+          --health-timeout 5s
+          --health-retries 5
+    env:
+      DATABASE_URL: postgres://ourdao:ourdao@localhost:5432/ourdao_load
+      CONCURRENT_CLIENTS: '200'
+      NOTIFICATION_ROUNDS: '20'
+      MEM_GROWTH_LIMIT_MB: '100'
+      RATE_LIMIT_MAX: '1000' # SSE handshakes count toward the global per-IP limit.
+    steps:
+      - uses: actions/checkout@d632683dd7b4114ad314bca15554477dd762a938 # v4.2.0
+      - uses: actions/setup-node@60edb5dd545a775178f52524783378180af0d1f8 # v4.0.2
+        with:
+          node-version: 22
+          cache: npm
+      - name: Install dependencies
+        run: npm ci
+      - name: Run migrations
+        run: npm run migrate
+      - name: Run SSE load test
+        run: ./scripts/load-test-stream.sh 2>&1 | tee stream-load.log
+      - name: Publish load test summary
+        if: always()
+        run: |
+          if [ -f stream-load.log ]; then
+            opened=$(sed -n 's/.*All \([0-9][0-9]*\) connections opened.*/\1/p' stream-load.log | tail -1)
+            growth=$(sed -n 's/.*RSS under load:.*growth \([-0-9.]*\) MiB.*/\1/p' stream-load.log | tail -1)
+            registered=$(sed -n 's/.*Registered client count: \([0-9][0-9]*\).*/\1/p' stream-load.log | tail -1)
+            {
+              echo '### SSE stream load test'
+              echo ''
+              echo '| Metric | Result |'
+              echo '| --- | ---: |'
+              echo "| Connections opened | ${opened:-unavailable} |"
+              echo "| Connections registered | ${registered:-unavailable} |"
+              echo "| RSS growth | ${growth:-unavailable} MiB |"
+              echo "| RSS growth limit | ${MEM_GROWTH_LIMIT_MB} MiB |"
+            } >> "$GITHUB_STEP_SUMMARY"
+          fi

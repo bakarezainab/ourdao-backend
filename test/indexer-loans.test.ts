@@ -4,6 +4,7 @@ import { pool, query } from '../src/db/index.js'
 import { applyEvent } from '../src/indexer/handlers.js'
 import { closeDb, resetDb } from './db.js'
 import { decodedEvent } from './fixtures.js'
+import { STREAM_CHANNELS } from '../src/api/stream.js'
 import type { LoanProposalRow, LoanRow, MemberRow } from '../src/types.js'
 
 describe('indexer handlers: loans', () => {
@@ -75,13 +76,104 @@ describe('indexer handlers: loans', () => {
     expect(rows[0]?.voter_count).toBe(3) // distinct voters, independent of weight
   })
 
+  it('loan_wait marks the proposal approved_pending_disbursement and notifies the borrower (issue #125)', async () => {
+    await applyEvent(client, decodedEvent('joined', { member: 'GBORROWER', fee: '500' }))
+    await applyEvent(
+      client,
+      decodedEvent('loan_req', { id: 90, borrower: 'GBORROWER', amount: '1000', total_repayment: '1100' })
+    )
+    await applyEvent(client, decodedEvent('loan_wait', { id: 90, amount: '1000' }))
+
+    const proposals = await query<LoanProposalRow>('SELECT * FROM loan_proposals WHERE id = 90')
+    expect(proposals[0]?.status).toBe('approved_pending_disbursement')
+
+    const notifs = await query<{ title: string }>(
+      'SELECT title FROM notifications WHERE address = $1 AND type = $2',
+      ['GBORROWER', 'info']
+    )
+    expect(notifs.map((n) => n.title)).toContain('Loan approved, awaiting funds')
+  })
+
+  it('a later loan_appr resolves an approved_pending_disbursement proposal (issue #125)', async () => {
+    await applyEvent(client, decodedEvent('joined', { member: 'GBORROWER', fee: '500' }))
+    await applyEvent(
+      client,
+      decodedEvent('loan_req', { id: 91, borrower: 'GBORROWER', amount: '1000', total_repayment: '1100' })
+    )
+    await applyEvent(client, decodedEvent('loan_wait', { id: 91, amount: '1000' }))
+    await applyEvent(client, decodedEvent('loan_appr', { id: 91, borrower: 'GBORROWER', amount: '1000' }))
+
+    const proposals = await query<LoanProposalRow>('SELECT * FROM loan_proposals WHERE id = 91')
+    expect(proposals[0]?.status).toBe('approved')
+
+    const loans = await query<LoanRow>('SELECT * FROM loans WHERE id = 91')
+    expect(loans[0]?.status).toBe('active')
+  })
+
+  it('re-delivering loan_wait is idempotent', async () => {
+    await applyEvent(client, decodedEvent('joined', { member: 'GBORROWER', fee: '500' }))
+    await applyEvent(
+      client,
+      decodedEvent('loan_req', { id: 92, borrower: 'GBORROWER', amount: '1000', total_repayment: '1100' })
+    )
+    const waitEv = decodedEvent('loan_wait', { id: 92, amount: '1000' })
+    await applyEvent(client, waitEv)
+    await applyEvent(client, waitEv)
+
+    const notifs = await query(
+      'SELECT * FROM notifications WHERE address = $1 AND title = $2',
+      ['GBORROWER', 'Loan approved, awaiting funds']
+    )
+    expect(notifs).toHaveLength(1)
+  })
+
+  it('loan_rej marks the proposal rejected with the contract-final tally in the raw event, and notifies the borrower (issue #124)', async () => {
+    await applyEvent(client, decodedEvent('joined', { member: 'GBORROWER', fee: '500' }))
+    await applyEvent(
+      client,
+      decodedEvent('loan_req', { id: 93, borrower: 'GBORROWER', amount: '1000', total_repayment: '1100' })
+    )
+    await applyEvent(client, decodedEvent('loan_rej', { id: 93, for_votes: '2', against_votes: '5' }))
+
+    const proposals = await query<LoanProposalRow>('SELECT * FROM loan_proposals WHERE id = 93')
+    expect(proposals[0]?.status).toBe('rejected')
+
+    const notifs = await query<{ title: string }>(
+      'SELECT title FROM notifications WHERE address = $1 AND type = $2',
+      ['GBORROWER', 'warning']
+    )
+    expect(notifs.map((n) => n.title)).toContain('Loan proposal rejected')
+  })
+
+  it('re-delivering loan_rej is idempotent and loan_rej for an unknown proposal is a no-op', async () => {
+    await applyEvent(client, decodedEvent('joined', { member: 'GBORROWER', fee: '500' }))
+    await applyEvent(
+      client,
+      decodedEvent('loan_req', { id: 94, borrower: 'GBORROWER', amount: '1000', total_repayment: '1100' })
+    )
+    const rejEv = decodedEvent('loan_rej', { id: 94, for_votes: '2', against_votes: '5' })
+    await applyEvent(client, rejEv)
+    await applyEvent(client, rejEv)
+
+    const notifs = await query(
+      'SELECT * FROM notifications WHERE address = $1 AND title = $2',
+      ['GBORROWER', 'Loan proposal rejected']
+    )
+    expect(notifs).toHaveLength(1)
+
+    await expect(
+      applyEvent(client, decodedEvent('loan_rej', { id: 99998, for_votes: '1', against_votes: '1' }))
+    ).resolves.toBe(STREAM_CHANNELS.loan_proposals)
+  })
+
   it('loan_appr marks the proposal approved, opens a loan seeded with total_repayment (not the bare principal), and flags the borrower as having an active loan', async () => {
     await applyEvent(client, decodedEvent('joined', { member: 'GBORROWER', fee: '10' }))
     await applyEvent(
       client,
       decodedEvent('loan_req', { id: 4, borrower: 'GBORROWER', amount: '1000', total_repayment: '1100' })
     )
-    await applyEvent(client, decodedEvent('loan_appr', { id: 4, borrower: 'GBORROWER', amount: '1000' }))
+    const chs = await applyEvent(client, decodedEvent('loan_appr', { id: 4, borrower: 'GBORROWER', amount: '1000' }))
+    expect(chs).toEqual([STREAM_CHANNELS.loan_proposals, STREAM_CHANNELS.loans])
 
     const proposals = await query<LoanProposalRow>('SELECT * FROM loan_proposals WHERE id = 4')
     expect(proposals[0]?.status).toBe('approved')
@@ -193,9 +285,53 @@ describe('indexer handlers: loans', () => {
     expect(notifs).toHaveLength(1)
   })
 
+  it('loan_exp transitions proposal status from pending to rejected and notifies borrower', async () => {
+    await applyEvent(client, decodedEvent('joined', { member: 'GBORROWER', fee: '500' }))
+    await applyEvent(
+      client,
+      decodedEvent('loan_req', { id: 80, borrower: 'GBORROWER', amount: '1000', total_repayment: '1100' })
+    )
+
+    const expEv = decodedEvent('loan_exp', { proposal_id: 80, borrower: 'GBORROWER' })
+    await applyEvent(client, expEv)
+
+    const proposals = await query<LoanProposalRow>('SELECT * FROM loan_proposals WHERE id = 80')
+    expect(proposals[0]?.status).toBe('rejected')
+
+    const notifs = await query<{ title: string; type: string }>(
+      'SELECT title, type FROM notifications WHERE address = $1 AND type = $2',
+      ['GBORROWER', 'warning']
+    )
+    expect(notifs).toHaveLength(1)
+    expect(notifs[0]?.title).toBe('Loan proposal expired')
+  })
+
+  it('re-delivering loan_exp is idempotent and loan_exp for unknown proposal is a no-op', async () => {
+    await applyEvent(client, decodedEvent('joined', { member: 'GBORROWER', fee: '500' }))
+    await applyEvent(
+      client,
+      decodedEvent('loan_req', { id: 81, borrower: 'GBORROWER', amount: '1000', total_repayment: '1100' })
+    )
+
+    const expEv = decodedEvent('loan_exp', { proposal_id: 81, borrower: 'GBORROWER' })
+    await applyEvent(client, expEv)
+    await applyEvent(client, expEv) // re-delivery
+
+    const proposals = await query<LoanProposalRow>('SELECT * FROM loan_proposals WHERE id = 81')
+    expect(proposals[0]?.status).toBe('rejected')
+
+    const notifs = await query('SELECT * FROM notifications WHERE address = $1 AND type = $2', ['GBORROWER', 'warning'])
+    expect(notifs).toHaveLength(1)
+
+    // Unknown proposal id is a no-op, doesn't throw
+    await expect(
+      applyEvent(client, decodedEvent('loan_exp', { proposal_id: 99999, borrower: 'GBORROWER' }))
+    ).resolves.toBe(STREAM_CHANNELS.loan_proposals)
+  })
+
   it('interest is a documented no-op (no per-member payload to apply)', async () => {
     await expect(
       applyEvent(client, decodedEvent('interest', { interest: '500', active: 10 }))
-    ).resolves.toBeUndefined()
+    ).resolves.toBe(STREAM_CHANNELS.interest)
   })
 })

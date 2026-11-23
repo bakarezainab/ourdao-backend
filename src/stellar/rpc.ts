@@ -1,10 +1,18 @@
 import { rpc } from '@stellar/stellar-sdk'
+import { SpanStatusCode, type Span } from '@opentelemetry/api'
 import { config } from '../config.js'
 import { rpcRateLimitRetriesCounter } from '../api/metrics.js'
 
 // Allow http:// for local/standalone RPC while defaulting to secure transport.
+// `headers` (issue #284) lets a managed/private RPC provider (QuickNode and
+// similar) require an API key or bearer token — only set when
+// STELLAR_RPC_HEADERS is non-empty, since passing `headers: {}` is harmless
+// but passing `undefined` more clearly reflects "not configured" if the SDK
+// ever branches on the option's presence rather than its contents.
+const rpcHeaders = config.stellar.rpcHeaders
 export const server = new rpc.Server(config.stellar.rpcUrl, {
   allowHttp: config.stellar.rpcUrl.startsWith('http://'),
+  ...(Object.keys(rpcHeaders).length > 0 ? { headers: rpcHeaders } : {}),
 })
 
 /**
@@ -61,10 +69,8 @@ export async function getLatestLedger(): Promise<number> {
   })
 }
 
-/** Latest-ledger sequence plus its hash (`id`). Soroban's `getEvents` does
- *  not expose a per-event ledger hash, so this tip info is the only hash the
- *  RPC gives us — used as forensic context and a coarse rewind signal for
- *  reorg detection (issue #23). */
+/** Latest-ledger sequence plus its hash (`id`) — used for the coarse rewind
+ *  signal in reorg detection (issue #23). */
 export async function getLatestLedgerInfo(): Promise<{ sequence: number; hash: string }> {
   return withRateLimitRetry('getLatestLedgerInfo', async () => {
     const res = await server.getLatestLedger()

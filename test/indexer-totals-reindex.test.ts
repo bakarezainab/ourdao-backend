@@ -11,11 +11,15 @@ import type { DecodedEvent } from '../src/stellar/events.js'
 // Only poller.ts pulls in stellar/rpc.ts; mocking it here keeps the network
 // out and lets the discontinuity test drive getLatestLedgerInfo. The RPC's
 // reported tip (sequence 40) sits below the cursor the test seeds (500).
-vi.mock('../src/stellar/rpc.js', () => ({
+vi.mock('../src/stellar/rpc.js', async (importOriginal) => {
+  const actual = await importOriginal<typeof import('../src/stellar/rpc.js')>()
+  return {
+    ...actual,
   server: { getEvents: vi.fn().mockResolvedValue({ events: [] }), getLatestLedger: vi.fn() },
   getLatestLedger: vi.fn().mockResolvedValue(40),
   getLatestLedgerInfo: vi.fn().mockResolvedValue({ sequence: 40, hash: 'HASH_LOW' }),
-}))
+  }
+})
 
 /** Simulate one ingested event: raw log row + derived fold, the way
  *  poller.ingestPage does. */
@@ -167,6 +171,34 @@ describe('indexer: reindex from the raw event log (issue #23)', () => {
 
     expect(after).toEqual(before)
   })
+
+  it('preserves notification read states across reindex (#52)', async () => {
+    const ev1 = decodedEvent('joined', { member: 'GB', fee: '100' })
+    const ev2 = decodedEvent('joined', { member: 'GC', fee: '50' })
+    await ingest(client, ev1)
+    await ingest(client, ev2)
+
+    // Mark notification for GB as read
+    await pool.query("UPDATE notifications SET read = true WHERE address = 'GB'")
+
+    const notifsBefore = await query<{ address: string; read: boolean; event_id: string }>(
+      'SELECT address, read, event_id FROM notifications ORDER BY address'
+    )
+    expect(notifsBefore).toHaveLength(2)
+    expect(notifsBefore.find((n) => n.address === 'GB')?.read).toBe(true)
+    expect(notifsBefore.find((n) => n.address === 'GC')?.read).toBe(false)
+
+    client.release()
+    await reindexFromEventLog()
+    client = await pool.connect()
+
+    const notifsAfter = await query<{ address: string; read: boolean; event_id: string }>(
+      'SELECT address, read, event_id FROM notifications ORDER BY address'
+    )
+    expect(notifsAfter).toHaveLength(2)
+    expect(notifsAfter.find((n) => n.address === 'GB')?.read).toBe(true)
+    expect(notifsAfter.find((n) => n.address === 'GC')?.read).toBe(false)
+  })
 })
 
 describe('indexer: ledger discontinuity detection (issue #23)', () => {
@@ -177,7 +209,7 @@ describe('indexer: ledger discontinuity detection (issue #23)', () => {
     await query(
       `INSERT INTO indexer_cursor (id, paging_token, last_ledger, contract_id)
        VALUES (1, 'tok', 500, 'CTESTCONTRACT')
-       ON CONFLICT (id) DO UPDATE SET paging_token = 'tok', last_ledger = 500, contract_id = 'CTESTCONTRACT'`
+       ON CONFLICT (contract_id) DO UPDATE SET paging_token = 'tok', last_ledger = 500, contract_id = 'CTESTCONTRACT'`
     )
     await expect(fetchOnce('CTESTCONTRACT')).rejects.toBeInstanceOf(ReorgDetectedError)
   })

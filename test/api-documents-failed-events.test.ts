@@ -1,6 +1,7 @@
 import { afterAll, beforeEach, describe, expect, it } from 'vitest'
 import type { FastifyInstance } from 'fastify'
 import { buildServer } from '../src/api/server.js'
+import { Keypair } from '@stellar/stellar-sdk'
 import { query } from '../src/db/index.js'
 import { closeDb, resetDb } from './db.js'
 
@@ -59,11 +60,111 @@ describe('API: GET /api/documents (issue #44)', () => {
     expect(invalid.statusCode).toBe(400)
   })
 
-  it('rejects a missing or non-numeric proposal_id before querying', async () => {
-    const missing = await app.inject({ method: 'GET', url: '/api/documents?kind=loan' })
-    expect(missing.statusCode).toBe(400)
+  it('rejects a non-numeric proposal_id before querying', async () => {
     const invalid = await app.inject({ method: 'GET', url: '/api/documents?kind=loan&proposal_id=abc' })
     expect(invalid.statusCode).toBe(400)
+    expect(invalid.json().error).toBe('invalid proposal_id query param')
+  })
+
+  it('rejects a negative proposal_id with the same accurate message (issue #378)', async () => {
+    const invalid = await app.inject({ method: 'GET', url: '/api/documents?kind=loan&proposal_id=-5' })
+    expect(invalid.statusCode).toBe(400)
+    expect(invalid.json().error).toBe('invalid proposal_id query param')
+  })
+})
+
+describe('API: GET /api/documents listing without a proposal (issue #189)', () => {
+  let app: FastifyInstance
+  const MEMBER = Keypair.random().publicKey()
+  const OTHER = Keypair.random().publicKey()
+
+  beforeEach(async () => {
+    await resetDb()
+    app = await buildServer()
+    await app.ready()
+    await query(
+      `INSERT INTO documents (event_id, proposal_id, kind, caller, ledger) VALUES
+         ('1-0', 1, 'loan', $1, 100),
+         ('2-0', 1, 'treasury', $2, 200),
+         ('3-0', 2, 'loan', $1, 300),
+         ('4-0', 3, 'treasury', $1, 400)`,
+      [MEMBER, OTHER]
+    )
+  })
+  afterAll(closeDb)
+
+  const ledgers = (body: Array<{ ledger: number }>) => body.map((d) => d.ledger)
+
+  it('lists every document newest-ledger-first with no filter', async () => {
+    const res = await app.inject({ method: 'GET', url: '/api/documents' })
+    expect(res.statusCode).toBe(200)
+    expect(ledgers(res.json())).toEqual([400, 300, 200, 100])
+  })
+
+  it('pages the unfiltered listing with ?before= and ?limit=', async () => {
+    const first = await app.inject({ method: 'GET', url: '/api/documents?limit=2' })
+    expect(ledgers(first.json())).toEqual([400, 300])
+    const next = await app.inject({ method: 'GET', url: '/api/documents?limit=2&before=300' })
+    expect(ledgers(next.json())).toEqual([200, 100])
+    expect(next.headers['cache-control']).toBe('public, max-age=3600, must-revalidate')
+  })
+
+  it("filters by caller — a member's attachment history", async () => {
+    const res = await app.inject({ method: 'GET', url: `/api/documents?caller=${MEMBER}` })
+    expect(res.statusCode).toBe(200)
+    const body = res.json()
+    expect(ledgers(body)).toEqual([400, 300, 100])
+    expect(body.every((d: { caller: string }) => d.caller === MEMBER)).toBe(true)
+  })
+
+  it('combines caller and kind', async () => {
+    const res = await app.inject({ method: 'GET', url: `/api/documents?caller=${MEMBER}&kind=loan` })
+    expect(ledgers(res.json())).toEqual([300, 100])
+  })
+
+  it('filters by kind alone', async () => {
+    const res = await app.inject({ method: 'GET', url: '/api/documents?kind=treasury' })
+    expect(ledgers(res.json())).toEqual([400, 200])
+  })
+
+  it('keeps the per-proposal query unchanged', async () => {
+    const res = await app.inject({ method: 'GET', url: '/api/documents?kind=loan&proposal_id=1' })
+    expect(res.statusCode).toBe(200)
+    expect(res.json()).toEqual([
+      expect.objectContaining({ proposal_id: 1, kind: 'loan', caller: MEMBER, ledger: 100 }),
+    ])
+  })
+
+  it('rejects an invalid caller, and proposal_id without kind', async () => {
+    const badCaller = await app.inject({ method: 'GET', url: '/api/documents?caller=not-an-address' })
+    expect(badCaller.statusCode).toBe(400)
+    expect(badCaller.json()).toMatchObject({ error: 'invalid Stellar address', code: 'BAD_REQUEST' })
+    const noKind = await app.inject({ method: 'GET', url: '/api/documents?proposal_id=1' })
+    expect(noKind.statusCode).toBe(400)
+  })
+
+  it('every query shape is served by its own index', async () => {
+    await query(
+      `INSERT INTO documents (event_id, proposal_id, kind, caller, ledger)
+       SELECT 'bulk-' || g, g % 50, CASE WHEN g % 2 = 0 THEN 'loan' ELSE 'treasury' END, 'G' || (g % 200), 1000 + g
+         FROM generate_series(1, 5000) g`
+    )
+    await query('ANALYZE documents')
+    const shapes: Array<[string, unknown[], string]> = [
+      ['WHERE kind = $1 AND proposal_id = $2', ['loan', 1], 'documents_proposal_idx'],
+      ['WHERE caller = $1', [MEMBER], 'documents_caller_idx'],
+      ['', [], 'documents_ledger_idx'],
+    ]
+    for (const [where, params, index] of shapes) {
+      const plan = await query<{ 'QUERY PLAN': string }>(
+        `EXPLAIN SELECT id, proposal_id, kind, caller, ledger, tx_hash, attached_at
+           FROM documents ${where} ORDER BY ledger DESC, id DESC LIMIT 50`,
+        params
+      )
+      const text = plan.map((r) => r['QUERY PLAN']).join('\n')
+      expect(text, where || 'unfiltered').toContain(index)
+      expect(text, where || 'unfiltered').not.toMatch(/Seq Scan/)
+    }
   })
 })
 
@@ -87,7 +188,48 @@ describe('API: GET /api/admin/failed-events (issue #43)', () => {
     const body = res.json()
     expect(body).toHaveLength(2)
     expect(body[0].event_id).toBe('2-0')
-    expect(body[0].error).toBe('boom-2')
+  })
+
+  // Issue #163: `error` holds raw driver/handler exception text — a
+  // Postgres error names a constraint, a column and a type; a TypeError
+  // carries internal structure. None of that belongs in a response any
+  // caller (authenticated or not) can read.
+  it('never puts the raw exception text in the response', async () => {
+    await query(
+      `INSERT INTO failed_events (event_id, symbol, ledger, error)
+       VALUES ('1-0', 'loan_dflt', 100, 'duplicate key value violates unique constraint "loans_pkey"')`
+    )
+    const res = await app.inject({ method: 'GET', url: '/api/admin/failed-events' })
+    expect(res.statusCode).toBe(200)
+    const body = res.json()
+    expect(body).toHaveLength(1)
+    expect(body[0].error).toBeUndefined()
+    expect(res.payload).not.toContain('loans_pkey')
+    expect(res.payload).not.toContain('duplicate key')
+  })
+
+  it('does not cache the response publicly', async () => {
+    const res = await app.inject({ method: 'GET', url: '/api/admin/failed-events' })
+    expect(res.headers['cache-control']).toBe('no-store')
+  })
+
+  it('paginates with a before cursor on id', async () => {
+    await query(
+      `INSERT INTO failed_events (event_id, symbol, ledger, error)
+       VALUES ('1-0', 'loan_dflt', 100, 'boom-1'), ('2-0', 'loan_dflt', 200, 'boom-2')`
+    )
+    const first = await app.inject({ method: 'GET', url: '/api/admin/failed-events?limit=1' })
+    const firstBody = first.json()
+    expect(firstBody).toHaveLength(1)
+    expect(firstBody[0].event_id).toBe('2-0')
+
+    const second = await app.inject({
+      method: 'GET',
+      url: `/api/admin/failed-events?limit=1&before=${firstBody[0].id}`,
+    })
+    const secondBody = second.json()
+    expect(secondBody).toHaveLength(1)
+    expect(secondBody[0].event_id).toBe('1-0')
   })
 
   it('the raw events row for a quarantined event is untouched', async () => {
@@ -99,7 +241,228 @@ describe('API: GET /api/admin/failed-events (issue #43)', () => {
       `INSERT INTO failed_events (event_id, symbol, ledger, error) VALUES ('1-0', 'loan_dflt', 100, 'boom')`
     )
     const res = await app.inject({ method: 'GET', url: '/api/events' })
-    expect(res.json()).toHaveLength(1)
-    expect(res.json()[0].id).toBe('1-0')
+    const body = res.json()
+    expect(body.events).toHaveLength(1)
+    expect(body.events[0].id).toBe('1-0')
+  })
+})
+
+describe('API: POST /api/admin/failed-events/batch-resolve (issue #287)', () => {
+  let app: FastifyInstance
+
+  beforeEach(async () => {
+    await resetDb()
+    app = await buildServer()
+    await app.ready()
+  })
+  afterAll(closeDb)
+
+  async function insertFailedEvents(n: number): Promise<number[]> {
+    const rows = await query<{ id: number }>(
+      `INSERT INTO failed_events (event_id, symbol, ledger, error)
+       SELECT g::text || '-0', 'loan_dflt', g, 'boom-' || g
+         FROM generate_series(1, $1) AS g
+       RETURNING id`,
+      [n]
+    )
+    return rows.map((r) => r.id)
+  }
+
+  async function buildAuthHeader(kp: ReturnType<typeof Keypair.random>): Promise<string> {
+    const challengeRes = await app.inject({
+      method: 'GET',
+      url: `/api/auth/challenge?address=${kp.publicKey()}`,
+    })
+    expect(challengeRes.statusCode).toBe(200)
+    const { nonce } = challengeRes.json<{ nonce: string }>()
+    const payload = Buffer.from(`${nonce}:${kp.publicKey()}`, 'utf8')
+    const signature = kp.sign(payload).toString('base64')
+    return `StellarSignature ${kp.publicKey()}:${signature}:${nonce}`
+  }
+
+  it('rejects unauthenticated requests with 401', async () => {
+    const ids = await insertFailedEvents(1)
+    const res = await app.inject({
+      method: 'POST',
+      url: '/api/admin/failed-events/batch-resolve',
+      payload: { ids, resolution: 'resolved' },
+    })
+    expect(res.statusCode).toBe(401)
+  })
+
+  it('resolves a batch of unresolved events in one call and writes to admin_audit_log', async () => {
+    const admin = Keypair.random()
+    const authHeader = await buildAuthHeader(admin)
+    const ids = await insertFailedEvents(3)
+    const res = await app.inject({
+      method: 'POST',
+      url: '/api/admin/failed-events/batch-resolve',
+      headers: { authorization: authHeader },
+      payload: { ids, resolution: 'resolved', note: 'reindexed and confirmed clean' },
+    })
+    expect(res.statusCode).toBe(200)
+    expect(res.json()).toEqual({ resolved: 3 })
+
+    const rows = await query<{ resolution: string; resolution_note: string; resolved_at: string | null }>(
+      `SELECT resolution, resolution_note, resolved_at FROM failed_events WHERE id = ANY($1) ORDER BY id`,
+      [ids]
+    )
+    expect(rows).toHaveLength(3)
+    for (const row of rows) {
+      expect(row.resolution).toBe('resolved')
+      expect(row.resolution_note).toBe('reindexed and confirmed clean')
+      expect(row.resolved_at).not.toBeNull()
+    }
+
+    // Verify admin_audit_log entry
+    const auditRows = await query<{ admin_address: string; action: string; payload: Record<string, unknown> }>(
+      `SELECT admin_address, action, payload FROM admin_audit_log WHERE admin_address = $1`,
+      [admin.publicKey()]
+    )
+    expect(auditRows).toHaveLength(1)
+    expect(auditRows[0]!.action).toBe('resolve_quarantined_event')
+    expect(auditRows[0]!.payload.ids).toEqual(ids)
+    expect(auditRows[0]!.payload.resolution).toBe('resolved')
+    expect(auditRows[0]!.payload.resolved_count).toBe(3)
+    expect(auditRows[0]!.payload.note).toBe('reindexed and confirmed clean')
+  })
+
+  it('accepts "ignored" as a resolution with no note', async () => {
+    const admin = Keypair.random()
+    const authHeader = await buildAuthHeader(admin)
+    const ids = await insertFailedEvents(1)
+    const res = await app.inject({
+      method: 'POST',
+      url: '/api/admin/failed-events/batch-resolve',
+      headers: { authorization: authHeader },
+      payload: { ids, resolution: 'ignored' },
+    })
+    expect(res.statusCode).toBe(200)
+    expect(res.json()).toEqual({ resolved: 1 })
+    const row = await query<{ resolution: string; resolution_note: string | null }>(
+      `SELECT resolution, resolution_note FROM failed_events WHERE id = $1`,
+      [ids[0]]
+    )
+    expect(row[0]?.resolution).toBe('ignored')
+    expect(row[0]?.resolution_note).toBeNull()
+  })
+
+  it('issue #492: "ignored" resolves without re-folding, and the full list still shows it', async () => {
+    const admin = Keypair.random()
+    const authHeader = await buildAuthHeader(admin)
+    const [ignoredId, replayedId] = await insertFailedEvents(2)
+    await query(
+      `INSERT INTO events (id, ledger, closed_at, contract_id, symbol, topics, data)
+       VALUES ('1-0', 1, now(), 'CTEST', 'loan_dflt', '[]', '{}')`
+    )
+    // Stands in for a successful reindex/replay, which writes 'resolved'.
+    await query(`UPDATE failed_events SET resolved_at = now(), resolution = 'resolved' WHERE id = $1`, [replayedId])
+
+    const res = await app.inject({
+      method: 'POST',
+      url: '/api/admin/failed-events/batch-resolve',
+      headers: { authorization: authHeader },
+      payload: { ids: [ignoredId], resolution: 'ignored' },
+    })
+    expect(res.statusCode).toBe(200)
+    expect(res.json()).toEqual({ resolved: 1 })
+
+    const fe = await query<{ resolution: string; resolved_at: string | null }>(
+      `SELECT resolution, resolved_at FROM failed_events WHERE id = $1`,
+      [ignoredId]
+    )
+    expect(fe[0]?.resolution).toBe('ignored')
+    expect(fe[0]?.resolved_at).not.toBeNull()
+    const ev = await query<{ folded_at: string | null }>(`SELECT folded_at FROM events WHERE id = '1-0'`)
+    expect(ev[0]?.folded_at).toBeNull()
+
+    const all = await app.inject({ method: 'GET', url: '/api/admin/failed-events' })
+    expect(all.statusCode).toBe(200)
+    const listed = all.json<Array<{ id: number; resolved_at: string | null }>>()
+    expect(listed.map((r) => r.id).sort()).toEqual([ignoredId, replayedId].sort())
+    expect(listed.every((r) => r.resolved_at !== null)).toBe(true)
+
+    const unresolved = await app.inject({ method: 'GET', url: '/api/admin/failed-events?unresolved=true' })
+    expect(unresolved.json()).toEqual([])
+
+    const byResolution = await query<{ id: number; resolution: string }>(
+      `SELECT id, resolution FROM failed_events WHERE id = ANY($1) ORDER BY id`,
+      [[ignoredId, replayedId]]
+    )
+    expect(byResolution.find((r) => r.id === ignoredId)?.resolution).toBe('ignored')
+    expect(byResolution.find((r) => r.id === replayedId)?.resolution).toBe('resolved')
+  })
+
+  it('excludes an already-resolved id from the count rather than erroring the batch', async () => {
+    const admin = Keypair.random()
+    const authHeader = await buildAuthHeader(admin)
+    const ids = await insertFailedEvents(2)
+    await query(`UPDATE failed_events SET resolved_at = now() WHERE id = $1`, [ids[0]])
+
+    const res = await app.inject({
+      method: 'POST',
+      url: '/api/admin/failed-events/batch-resolve',
+      headers: { authorization: authHeader },
+      payload: { ids, resolution: 'resolved' },
+    })
+    expect(res.statusCode).toBe(200)
+    expect(res.json()).toEqual({ resolved: 1 })
+  })
+
+  it('rejects an empty or missing ids array', async () => {
+    const admin = Keypair.random()
+    const authHeader = await buildAuthHeader(admin)
+    for (const payload of [{ ids: [], resolution: 'resolved' }, { resolution: 'resolved' }]) {
+      const res = await app.inject({
+        method: 'POST',
+        url: '/api/admin/failed-events/batch-resolve',
+        headers: { authorization: authHeader },
+        payload,
+      })
+      expect(res.statusCode).toBe(400)
+    }
+  })
+
+  it('rejects a non-integer or negative id', async () => {
+    const admin = Keypair.random()
+    const authHeader = await buildAuthHeader(admin)
+    for (const ids of [[1.5], [-1], ['1']]) {
+      const res = await app.inject({
+        method: 'POST',
+        url: '/api/admin/failed-events/batch-resolve',
+        headers: { authorization: authHeader },
+        payload: { ids, resolution: 'resolved' },
+      })
+      expect(res.statusCode).toBe(400)
+    }
+  })
+
+  it('rejects a resolution outside resolved/ignored', async () => {
+    const admin = Keypair.random()
+    const authHeader = await buildAuthHeader(admin)
+    const ids = await insertFailedEvents(1)
+    const res = await app.inject({
+      method: 'POST',
+      url: '/api/admin/failed-events/batch-resolve',
+      headers: { authorization: authHeader },
+      payload: { ids, resolution: 'archived' },
+    })
+    expect(res.statusCode).toBe(400)
+  })
+
+  it('is atomic: applies to all matched rows or none', async () => {
+    const admin = Keypair.random()
+    const authHeader = await buildAuthHeader(admin)
+    const ids = await insertFailedEvents(5)
+    const res = await app.inject({
+      method: 'POST',
+      url: '/api/admin/failed-events/batch-resolve',
+      headers: { authorization: authHeader },
+      payload: { ids, resolution: 'resolved' },
+    })
+    expect(res.statusCode).toBe(200)
+    expect(res.json()).toEqual({ resolved: 5 })
+    const stillUnresolved = await query(`SELECT id FROM failed_events WHERE resolved_at IS NULL`)
+    expect(stillUnresolved).toHaveLength(0)
   })
 })

@@ -1,0 +1,28 @@
+# CODEOWNERS
+#
+# Paths that can run code on a contributor's machine or in CI without anyone
+# reading it, plus the application source that README.md and
+# docs/BRANCH_PROTECTION.md say needs a code owner, are listed here. A "main"
+# ruleset requires approval from one of these owners whenever a PR touches
+# them. Everything else needs no code-owner review.
+#
+# Patterns are unanchored on purpose, so they also match nested app folders
+# (apps/, packages/*, bindings/ts/ and so on).
+
+# Editor and container config: tasks can run when a folder is opened.
+.vscode/        @precious-akpan @bbjiggy @0xMegie @stephanieefeakpokrire-droid
+.devcontainer/  @precious-akpan @bbjiggy @0xMegie @stephanieefeakpokrire-droid
+
+# Package manifests and lockfiles: install and run scripts, dependency sources.
+package.json       @precious-akpan @bbjiggy @0xMegie @stephanieefeakpokrire-droid
+package-lock.json  @precious-akpan @bbjiggy @0xMegie @stephanieefeakpokrire-droid
+
+# Workflows, Dependabot config and this file.
+.github/  @precious-akpan @bbjiggy @0xMegie @stephanieefeakpokrire-droid
+
+# Application source, with auth, the indexer and migrations called out as in
+# docs/BRANCH_PROTECTION.md.
+src/                @precious-akpan @bbjiggy @0xMegie @stephanieefeakpokrire-droid
+src/auth.ts         @precious-akpan @bbjiggy @0xMegie @stephanieefeakpokrire-droid
+src/indexer/        @precious-akpan @bbjiggy @0xMegie @stephanieefeakpokrire-droid
+src/db/migrations/  @precious-akpan @bbjiggy @0xMegie @stephanieefeakpokrire-droid

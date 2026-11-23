@@ -1,0 +1,600 @@
+# Deployment guide
+
+This document covers everything needed to run `ourdao-backend` outside a laptop: the two-process topology, first-deploy decisions, configuration, backup, redeploy, and day-to-day operations. It deliberately omits platform-specific manifests — the requirements below map to any container scheduler or VM.
+
+> **Living document.** Several open issues in this repo change deployment-relevant behaviour: Docker/readiness improvements and migration tooling. This document will be updated as those land. Worker leader election has already landed (#584); see [The worker must be a singleton](#the-worker-must-be-a-singleton). Where a known gap exists it is called out inline.
+
+## Table of contents
+
+- [Two-process topology](#two-process-topology)
+- [The image](#the-image)
+- [First deploy: the cold-start decision](#first-deploy-the-cold-start-decision)
+- [Required configuration](#required-configuration)
+- [Full configuration reference](#full-configuration-reference)
+- [Database connections](#database-connections)
+- [Database credential rotation](#database-credential-rotation)
+- [Database maintenance and growth](#database-maintenance-and-growth)
+- [Backup and recovery](#backup-and-recovery)
+- [Release management and migrations](#release-management-and-migrations)
+- [Rolling back a bad deploy](#rolling-back-a-bad-deploy)
+- [Container security and image scanning](#container-security-and-image-scanning)
+- [Redeploying the contract](#redeploying-the-contract)
+- [Operations](#operations)
+- [Reorg recovery](#reorg-recovery)
+- [Soroban RPC wire smoke testing](#soroban-rpc-wire-smoke-testing)
+- [Related repos](#related-repos)
+
+---
+
+## Two-process topology
+
+```
+Soroban RPC
+     │
+     ▼  poll getEvents
+┌──────────┐          ┌──────────┐
+│  worker  │──writes──▶ Postgres ◀──reads──│   API   │──▶ frontend
+│ (×1 only)│          └──────────┘         │  (×N)   │
+└──────────┘
+```
+
+The backend is two separate processes sharing one Postgres database.
+
+**API** (`node dist/index.js`) is stateless and horizontally scalable. Run as many instances as load requires. Each instance migrates the database on boot (idempotent, serialized by a Postgres advisory lock) and opens a pool of database connections.
+
+**Worker** (`node dist/worker.js`) is the indexer: it polls the Soroban RPC for new contract events, writes them to the append-only `events` log, and folds each event into the derived tables (`members`, `loan_proposals`, `loans`, `treasury_proposals`, `notifications`) inside a single database transaction. It also migrates on boot.
+
+### The worker must be a singleton
+
+**Run exactly one worker at a time. Running two or more corrupts data silently.**
+
+The folding operations are non-idempotent: vote tallies are incremented, contribution balances are adjusted, and notification rows are inserted each time an event is processed. If two workers process the same event page concurrently, each one increments the tally independently — the result is a number higher than the true on-chain value, with no error, no warning, and no way to detect it after the fact short of a full reindex. Unlike most "don't run two" warnings, this one has no database-level guard; the corruption is silent and accumulates.
+
+The safe pattern is:
+- **One worker process.** No auto-scaling, no redundant replicas for the worker.
+- **Restart-safe.** The worker persists its resume position in `indexer_cursor`. A crashed worker can be restarted safely — it will resume from where it left off. A clean shutdown waits up to 10 seconds for the current page to finish before closing the database pool.
+- **Leader election (issue #584).** On startup, the worker takes a dedicated Postgres advisory lock — held on its own connection for the entire lifetime of the poll loop, distinct from the shorter-lived locks used for migrations and reindex/replay — and refuses to start (logging a clear error) if it can't acquire it, i.e. another worker instance already holds it. The lock is released cleanly on `SIGTERM`/`SIGINT`. If a worker crashes outright, no release code runs, but Postgres automatically frees a session-level advisory lock as soon as it notices that connection is gone, so a replacement worker started by the scheduler can acquire it as soon as the crashed one's connection is actually closed (not merely once the scheduler decides to start a replacement). This makes two workers running concurrently *impossible* rather than merely discouraged — it does not add hot-standby failover; the scheduler must still notice a dead worker and start a replacement itself.
+
+---
+
+## The image
+
+Both processes run from the same Docker image. The default `CMD` starts the API; override it for the worker:
+
+```bash
+# Build
+docker build -t ourdao-backend .
+
+# API (default CMD)
+docker run --env-file .env -p 4000:4000 ourdao-backend
+
+# Worker (CMD override)
+docker run --env-file .env ourdao-backend node dist/worker.js
+
+# One-off reindex (see Backup and recovery)
+docker run --env-file .env ourdao-backend node dist/indexer/reindex.js
+```
+
+The supported Node.js runtime is **22** (the `node:22-alpine` base image, `.node-version`, and the `engines.node` field in `package.json`). Node 20 reached end-of-life in April 2026 and is no longer supported (issue #350). CI tests Node 22 and 24.
+
+The image runs as the non-root `node` user with `tini` as PID 1. `tini` handles signal forwarding and zombie reaping — both are required for the worker's graceful shutdown to work. The `HEALTHCHECK` targets `GET /health` (a no-DB liveness check) rather than `/ready` (which does a DB round-trip and reports `503` when the indexer is behind — useful as a readiness probe in an orchestrator, not a container health signal).
+
+**Do not run the worker with a health check that restarts it on `503` from `/ready`.** If the indexer falls behind for any reason (RPC hiccup, a slow page), `/ready` returns `503` and a health check targeting it would kill and restart the worker in a loop, losing its place and creating exactly the restart storm that compounds the problem. Use `/health` for container health and `/ready` as a readiness/load-balancer probe on the API only.
+
+---
+
+## First deploy: the cold-start decision
+
+> This is the single most consequential decision at deploy time. Read this section before starting the worker for the first time.
+
+The Soroban RPC retains approximately **24 hours** of raw event history. On a cold start (empty database), the worker begins indexing from a ledger you specify. If that ledger is older than the RPC's retention window, the RPC clamps it to the oldest ledger it still has — **events before that point are gone and cannot be recovered later**, because the RPC has discarded them and there is no other source.
+
+### What to set
+
+**`START_LEDGER`** — the ledger sequence number of the OurDAO contract's deployment transaction. Set this to the ledger the contract was deployed at, not `0`.
+
+Getting it right:
+- Find the contract's deployment transaction in a Stellar explorer (e.g. [Stellar Expert](https://stellar.expert) or [Stellarchain.io](https://stellarchain.io)) and note its ledger sequence number.
+- Set `START_LEDGER=<that number>` before the first boot.
+- Once the worker has started successfully and advanced its cursor past that ledger, `START_LEDGER` has no further effect — it is only used on an empty cursor.
+
+**If the contract was deployed more than ~24 hours ago** and you are doing a fresh deploy now, the RPC no longer has events from the deployment ledger. The worker will start from the oldest available ledger and index forward from there. Events before that window — joins, loan requests, votes, treasury actions — will not appear in the derived tables. This is permanent.
+
+If that history matters, the only recourse is an archive node or a Horizon-compatible event archive that retains full history. The public Soroban RPC endpoints do not.
+
+**`START_LOOKBACK_LEDGERS`** (default: `17280`, approximately 24 hours at ~5s/ledger) — used only when `START_LEDGER` is `0`. The worker starts from `current_ledger - START_LOOKBACK_LEDGERS`. This is suitable for a deployment where the contract was also deployed very recently, or where you intentionally want to index only recent history.
+
+### Summary
+
+| Situation | What to set |
+|---|---|
+| Contract deployed recently (within ~24h) | `START_LEDGER=<contract deploy ledger>` |
+| Contract deployed recently, only recent history needed | `START_LEDGER=0` and tune `START_LOOKBACK_LEDGERS` |
+| Contract deployed more than ~24h ago | `START_LEDGER=<deploy ledger>` — history before the RPC window is irretrievable |
+
+---
+
+## Required configuration
+
+These must be set correctly before starting either process. Wrong values here cause silent misbehaviour rather than a startup error.
+
+### `CONTRACT_ID`
+
+The deployed OurDAO contract id (starts with `C`). Required for the worker — it will refuse to start without it. The API will start without it but will serve empty data.
+
+Set this to the specific contract id this deployment indexes. If `CONTRACT_ID` does not match the id stored in the database's `indexer_cursor` row, the worker refuses to start — it detects that you are pointing at a different contract and halts rather than merge two deployments' state. See [Redeploying the contract](#redeploying-the-contract).
+
+### `DATABASE_URL`
+
+Postgres connection string, e.g. `postgres://user:password@host:5432/dbname`. Alternatively set the individual `PGHOST`, `PGPORT`, `PGUSER`, `PGPASSWORD`, `PGDATABASE` variables. Both processes read the same database.
+
+### Database credential rotation
+
+`DATABASE_URL` is read when a process starts. Existing pooled connections keep
+using the old credential, so changing an environment variable alone does not
+rotate a running API or worker. `NONCE_STORE=postgres` uses this same database
+pool on authenticated notification requests; it has no separate secret, but
+those requests are unavailable during an API restart just like every other API
+request.
+
+The lowest-risk procedure is a short, controlled restart. Create the new
+database role/password, update `DATABASE_URL` (or the individual `PG*`
+variables) for **both** process definitions, then restart the worker and API.
+
+1. If the worker is draining a page, let its clean shutdown finish first. It
+   waits up to ten seconds for the current page transaction; do not start its
+   replacement until the old worker has stopped, because the worker must remain
+   a singleton. If a migration is running on boot, let that boot finish rather
+   than terminating it midway.
+2. Start the replacement worker once. Both entrypoints run idempotent migrations
+   on boot behind a Postgres advisory lock, so a rotation restart may wait for
+   an already-running migration, but it cannot run a competing migration.
+3. Roll API instances one at a time. Drain or close any open SSE clients on an
+   instance before stopping it, then start the replacement and wait for
+   `/ready`. Current releases fan SSE clients out from one dedicated LISTEN
+   connection per API process, rather than allocating a database connection per
+   client; nevertheless SSE sockets are long-lived and must be closed or
+   drained deliberately when retiring an instance.
+4. Verify the worker advances `lastIndexedLedger`, API `/ready` is healthy, and
+   an authenticated notification request works when `NONCE_STORE=postgres`.
+   Revoke the old credential only after no old process remains connected.
+
+This causes up to the worker's clean-drain time (normally seconds) and each API
+instance's restart time. A multi-instance API remains available during a rolling
+restart; a singleton API has a brief outage. For no credential-induced API
+downtime, create an overlapping database credential, deploy it to new API
+instances and the replacement worker, verify them, then revoke the old one.
+The worker still requires a stop-before-start handoff, so indexing pauses for
+that handoff but API reads continue. There are no other application-managed
+secrets in this deployment surface: `CONTRACT_ID`, RPC URL, network passphrase,
+and CORS origin are identifiers/configuration, while wallet signatures are
+provided per request and never stored as a deploy-time secret.
+
+### `CORS_ORIGIN`
+
+**Defaults to `http://localhost:3000`.** In production, set this to the deployed frontend's origin (e.g. `https://app.ourdao.xyz`). If left at the default, the browser will block every cross-origin request from the real frontend — the API will appear to work from `curl` and fail silently in the browser.
+
+Setting it to `*` is supported as an explicit opt-in and logs a warning at startup.
+
+### `NETWORK_PASSPHRASE`
+
+Defaults to the Stellar testnet passphrase. For mainnet set it to:
+
+```
+Public Global Stellar Network ; September 2015
+```
+
+### `TRUST_PROXY`
+
+Set to `true` if the API runs behind a reverse proxy (load balancer, ingress controller, etc.). Without it, rate limiting applies per proxy IP rather than per client IP — every client shares one rate-limit bucket.
+
+### `NONCE_STORE`
+
+Set to `postgres` (the default) for any multi-instance API deployment. The `memory` backend is ephemeral and only suitable for local development or single-process testing — nonces are lost on restart, which allows replay attacks on the notification authentication endpoints.
+
+---
+
+## Full configuration reference
+
+All configuration is environment-driven. See [`.env.example`](../.env.example) for the full annotated list. The table below notes which variables are relevant to production deployments specifically.
+
+| Variable | Default | Notes |
+|---|---|---|
+| `PORT` | `4000` | API listen port. |
+| `HOST` | `0.0.0.0` | API listen address. |
+| `CORS_ORIGIN` | `http://localhost:3000` | **Set to the real frontend origin in production.** See above. |
+| `CONTRACT_ID` | _(none)_ | **Required.** The deployed OurDAO contract id. |
+| `SOROBAN_RPC_URL` | testnet | Set to your preferred RPC endpoint. Public endpoints are rate-limited. |
+| `NETWORK_PASSPHRASE` | testnet | **Set to mainnet passphrase for mainnet deployments.** |
+| `DATABASE_URL` | _(none)_ | Postgres connection string. |
+| `DB_POOL_MAX` | `10` | Per-instance request pool size. See [Database connections](#database-connections) — `/api/stream` no longer needs headroom here (issue #152). |
+| `DB_CONNECTION_TIMEOUT_MS` | `5000` | How long a caller waits for a free pooled connection before failing (issue #167). |
+| `DB_STATEMENT_TIMEOUT_MS` | `10000` | Server-side `statement_timeout` for pooled connections. `0` disables. Reindex and migrations exempt themselves. |
+| `DB_IDLE_TIMEOUT_MS` | `30000` | Idle pooled connections are closed after this long. `0` disables eviction. |
+| `DB_APPLICATION_NAME` | `ourdao-api` / `ourdao-worker` | `pg_stat_activity.application_name`. Leave unset so each process names itself. |
+| `NONCE_STORE` | `postgres` | Keep `postgres` for multi-instance API. |
+| `START_LEDGER` | `0` | **Set to the contract's deploy ledger on first boot.** See above. |
+| `START_LOOKBACK_LEDGERS` | `17280` | Used only when `START_LEDGER=0`. |
+| `POLL_INTERVAL_MS` | `5000` | How often the worker polls for new events (ms). |
+| `EVENTS_PAGE_LIMIT` | `100` | Events fetched per RPC call. |
+| `POLL_MAX_BACKOFF_MS` | `60000` | Cap for exponential backoff after consecutive poll failures. |
+| `DRAIN_MAX_PAGES` | `20` | Max pages drained per poll cycle when catching up. |
+| `DRAIN_MAX_MS` | `30000` | Max wall-clock ms for one drain cycle. |
+| `INDEXER_STALE_AFTER_MS` | `120000` | Cursor idle time before `/ready` reports `503`. |
+| `INDEXER_QUARANTINE_AFTER_FAILURES` | `3` | Consecutive failures before an event is quarantined instead of retried. |
+| `INDEXER_RESET_ON_CONTRACT_CHANGE` | `false` | Set to `true` for one boot when repointing at a new contract. **Unset after.** |
+| `RATE_LIMIT_MAX` | `100` | Requests per window per IP. |
+| `RATE_LIMIT_WINDOW_MS` | `60000` | Rate limit window (ms). |
+| `RATE_LIMIT_EVENTS_MAX` | `30` | Stricter limit for `GET /api/events`. |
+| `STATS_CACHE_MS` | `5000` | In-process cache TTL for `/api/stats`. `0` disables. |
+| `STATS_MAX_CONCURRENT` | `1` | Per-process cap for uncached stats recomputations; excess requests get `503`. |
+| `STATS_RETRY_AFTER_SECONDS` | `1` | Retry delay sent with a shed stats response. |
+| `TRUST_PROXY` | `false` | **Set to `true` behind a reverse proxy.** |
+| `HTTP_BODY_LIMIT_BYTES` | `16384` | Max request body; larger bodies get `413 PAYLOAD_TOO_LARGE`. The API is read-only, so there is rarely a reason to raise it. |
+| `HTTP_REQUEST_TIMEOUT_MS` | `30000` | Max time to receive a complete request (headers + body); a stalled request gets `408 REQUEST_TIMEOUT` and the socket is closed. Node checks this every 30s, so a stalled request is closed within this value + 30s. Does not limit response time — SSE streams are unaffected. `0` disables. |
+| `HTTP_CONNECTION_TIMEOUT_MS` | `60000` | Socket inactivity timeout. Keep it above the 30s SSE heartbeat. `0` disables. |
+| `HTTP_KEEP_ALIVE_TIMEOUT_MS` | `72000` | Idle keep-alive timeout. **Keep it above your load balancer's idle timeout** (e.g. 60s on AWS ALB), or the LB may reuse a socket the server just closed and return `502`. |
+
+---
+
+## Database connections
+
+Both the API and the worker maintain a pool of Postgres connections. They connect to the same database but are separate OS processes with separate pools — size them together.
+
+- **Worker**: one long-running poller with modest concurrency. The pool is used for migrations on boot, then for a rolling sequence of per-page transactions. A pool size of 2–5 is typically sufficient.
+- **API**: stateless and horizontally scalable. Each instance maintains its own pool, sized via `DB_POOL_MAX` (default 10, `pg`'s own default made explicit). Pool size depends on expected *request* query concurrency only — `/api/stream` does **not** add to it: each instance keeps exactly one extra long-lived connection for its shared SSE listener, regardless of how many browser tabs are connected to that instance (issue #152 — a per-client connection here used to let ten concurrent streams alone exhaust the whole request pool).
+- **Timeouts** (all in ms, all environment-driven): `DB_CONNECTION_TIMEOUT_MS` bounds the wait for a free connection (default 5000 — an exhausted pool fails rather than hangs); `DB_STATEMENT_TIMEOUT_MS` is a server-side per-statement limit (default 10000); `DB_IDLE_TIMEOUT_MS` closes idle connections (default 30000). `npm run reindex` and migrations lift the statement timeout for their own transaction/session only.
+- **Telling processes apart**: each process sets `application_name` — `ourdao-api`, `ourdao-worker`, `ourdao-api-listener` (the SSE listener), and `ourdao-reindex` while a rebuild runs — so `SELECT application_name, count(*) FROM pg_stat_activity GROUP BY 1` shows who holds what. Set `DB_APPLICATION_NAME` only if you need a custom name and give the API and worker different values.
+- **Total connections**: `worker_pool + (api_instances × (DB_POOL_MAX + 1))` must fit within Postgres's `max_connections` (the `+ 1` per instance is its stream listener). The default is 100; budget accordingly, or use a connection pooler (PgBouncer, RDS Proxy) if you scale API instances beyond a handful.
+
+### Where SSE clients fit in the budget
+
+Open `/api/stream` clients do **not** appear in the connection formula above, and that is deliberate — not an omission:
+
+- **Per instance, streams cost exactly one Postgres connection in total** (the shared `ourdao-api-listener` session), whether one tab or `STREAM_MAX_CONNECTIONS` tabs are connected. They never check out a connection from the `DB_POOL_MAX` request pool, so no number of concurrent streams can starve ordinary queries.
+- **The hard per-instance limit on streams is `STREAM_MAX_CONNECTIONS`** (default 100; `STREAM_MAX_CONNECTIONS_PER_IP`, default 10, per client IP). Past it a new stream gets `503 SERVICE_UNAVAILABLE` with `Retry-After`. What streams consume is sockets/file descriptors and a little memory each — size the host's `ulimit -n` and your load balancer's connection limits for it, not `max_connections`.
+- **Historical deadlock, for anyone reading older guidance** (issue #188): before issue #152 every stream held a dedicated connection *from the request pool* for its whole lifetime, so the real budget was `worker_pool + (api_instances × (DB_POOL_MAX + concurrent_streams))` — except that streams drew from the same pool rather than adding to it. With the default pool of 10, ten concurrent tabs on one instance took every connection, and that instance's ordinary queries then waited for a free connection forever. If you run a release that predates #152, keep concurrent streams per instance strictly below `DB_POOL_MAX`, or the instance deadlocks.
+
+Worked example, including streams: 3 API instances with `DB_POOL_MAX=10` and `STREAM_MAX_CONNECTIONS=100`, plus a worker pool of 5, at peak with every instance holding 100 open streams:
+
+| | Postgres connections | Sockets |
+|---|---|---|
+| Worker | 5 | — |
+| Request pools | 3 × 10 = 30 | — |
+| Stream listeners | 3 × 1 = 3 | — |
+| SSE clients | 0 | 3 × 100 = 300 |
+| **Total** | **38** of `max_connections` | 300 open streams (plus ordinary request sockets) |
+
+Doubling `STREAM_MAX_CONNECTIONS` to 200 leaves the Postgres column at 38 and doubles only the socket column.
+
+### Multi-instance API state and PgBouncer
+
+Each API instance has its own `/api/stats` cache, nonce memory store (when
+`NONCE_STORE=memory`), SSE clients, and single long-lived stream listener.
+Postgres data and the default `NONCE_STORE=postgres` nonce store are shared.
+Consequently, cached stats from two instances can disagree for up to
+`STATS_CACHE_MS`, and stream socket limits apply independently to every
+instance.
+
+The stream listener uses Postgres `LISTEN`/`NOTIFY`, whose subscriptions belong
+to a database session. If PgBouncer is used, route the listener through
+**session pooling** (or directly to Postgres). Transaction pooling may assign a
+different server connection after `LISTEN` and silently lose notifications.
+Ordinary request-pool traffic can use transaction pooling; deployments that
+split the two paths should point the stream listener at the session-pooled or
+direct endpoint.
+
+For example, three API instances with `DB_POOL_MAX=10` and a worker pool of 5
+budget `5 + (3 × (10 + 1)) = 38` Postgres connections. They can accept up to
+`3 × STREAM_MAX_CONNECTIONS` SSE clients in total, subject to load-balancer
+distribution, while still using only three listener connections. With
+`NONCE_STORE=memory`, the same client could receive independent nonces from
+different instances; use `postgres` for this topology.
+
+The schema is applied idempotently by both processes on boot, serialized by a Postgres advisory lock. You do not need a separate migration step. Concurrent boots (e.g. a rolling deploy of the API alongside the worker restarting) are safe.
+
+### PgBouncer and LISTEN/NOTIFY incompatibility
+
+**Postgres LISTEN/NOTIFY does not work with PgBouncer in transaction pooling mode.**
+
+PgBouncer's transaction pooling mode reassigns backend connections per transaction. LISTEN is per-connection state, so subscriptions issued on connection A are silently lost when the next transaction runs on connection B. The SSE stream (`/api/stream`) relies on LISTEN/NOTIFY to deliver real-time change notifications; with PgBouncer in transaction mode, notifications are never delivered—clients receive only heartbeats.
+
+**If using PgBouncer:**
+1. **Recommended**: Use **session pooling mode** instead of transaction mode for the API process. The worker can still go through PgBouncer in transaction mode (it doesn't use LISTEN/NOTIFY).
+2. **Alternative**: Point the API's `DATABASE_URL` directly at Postgres, bypassing PgBouncer entirely. The indexer can still go through PgBouncer.
+3. **Polling only**: Deploy without SSE—clients poll instead. The REST API works through PgBouncer in transaction mode without restriction.
+
+Session pooling sacrifices PgBouncer's primary scaling benefit (connection reuse), but the shared listener model (issue #152) means each API instance holds only one extra LISTEN connection regardless of connected client count—PgBouncer's value here is limited. For most deployments, bypassing PgBouncer for the API is simplest.
+
+See [`docs/REALTIME-NOTIFICATIONS.md`](./REALTIME-NOTIFICATIONS.md) for the full SSE/LISTEN/NOTIFY architecture and why this incompatibility exists.
+
+---
+
+## Backup and recovery
+
+### What to back up
+
+**The `events` table is the only irreplaceable data.** It is the append-only raw log of every on-chain event this service has indexed. Everything else — `members`, `loan_proposals`, `loans`, `treasury_proposals`, `notifications`, `indexer_cursor` — is derived from it and can be reconstructed in full.
+
+Back up `events` (and `schema_migrations`) with your normal Postgres backup strategy. The other tables do not need to be in your recovery path, though including them in a full-database backup costs nothing and speeds up recovery by skipping a reindex.
+
+A minimal backup that enables full recovery:
+```
+events
+schema_migrations
+```
+
+A convenient full backup restores to a working state immediately with no reindex needed:
+```
+pg_dump <dbname>  # all tables
+```
+
+### Recovery
+
+If the derived tables are lost or corrupted (disk failure, accidental truncation, a bug in an event handler), they can be rebuilt from the raw log:
+
+```bash
+# Bare Node
+node dist/indexer/reindex.js
+
+# Docker
+docker run --env-file .env ourdao-backend node dist/indexer/reindex.js
+```
+
+`reindex` truncates every derived table and replays the full `events` log in one database transaction. The result is byte-identical to the state produced by the incremental indexer — this is asserted by the test suite. At current scale (~100k events), a reindex completes in a few seconds. See [`docs/events-storage.md`](./events-storage.md) for growth projections and the threshold at which reindex time becomes a concern.
+
+`reindex` is also the repair path after a detected reorg (see [Reorg detection](../README.md#reorg-detection)) and after fixing a quarantined event handler (see [Quarantine](../README.md#quarantine)).
+
+### After a detected reorg
+
+When the worker detects a ledger discontinuity it records it in `reorg_halts` and exits non-zero. From then on `GET /ready` answers `503 {"reason":"reorg_detected", "reorg": {...}}`, `GET /api/stats` reports `reorgDetected: true`, and **the worker refuses to start** with `[indexer] REFUSING TO RESUME` — a supervisor restart cannot fold past the divergence. The API keeps serving the already-folded state.
+
+1. Stop the worker (or leave it stopped; it will not resume on its own).
+2. Triage with [`docs/REORG_RECOVERY.md`](./REORG_RECOVERY.md) section 5: read the record (`SELECT * FROM reorg_halts WHERE cleared_at IS NULL ORDER BY id DESC LIMIT 1;` or `GET /ready`), confirm the chain state against a second RPC.
+3. Real divergence: run `npm run reindex` (`node dist/indexer/reindex.js` in the container). It rebuilds every derived table from the raw log and clears the halt in the same transaction. Do not clear the halt by hand and restart the worker instead — that folds the diverged history on top of the old state.
+4. False alarm (an RPC that briefly served a wrong hash and now agrees again): run `npm run reorg:clear` (`node dist/indexer/clear-reorg.js`). Nothing is rebuilt; the record is kept with `cleared_by = 'operator'`.
+5. Start the worker and confirm `GET /ready` is `200` and `GET /api/stats.reorgDetected` is `false`.
+
+The records are never deleted, so `SELECT * FROM reorg_halts ORDER BY id` is the audit trail of every halt and how it was closed.
+
+### The `events` log is append-only
+
+`events` rows are never mutated or deleted by normal operation. This is an architectural invariant, not just a convention — it is what makes `reindex` reliable. Do not write application code that modifies existing `events` rows. If an event was incorrectly decoded, fix the decoder and reindex; do not patch the raw row.
+
+### Notification retention and deletion
+
+`notifications` contains rendered, per-member convenience text derived from
+the event log. It is retained indefinitely today because there is no pruning
+job. This is an operational policy, not an audit requirement: only the raw,
+append-only `events` table is the durable audit record.
+
+Deletion of an exited member's notification history is currently unsupported.
+Deleting rows manually is also not durable: `npm run reindex` truncates all
+derived tables and regenerates every notification from `events`, including
+text previously removed. A future retention or member-deletion mechanism must
+apply the same policy during event replay before deletion can be promised.
+
+---
+
+## Release management and migrations
+
+Before deploying an image upgrade or pulling a new release, operators must consult [CHANGELOG.md](../CHANGELOG.md).
+
+Releases follow [Semantic Versioning](https://semver.org/). Each release entry in the changelog explicitly flags operational prerequisites:
+- **`[Migration: <file>]`** — Release carries one or more database migrations. Schema migrations run automatically on boot (serialized by a Postgres advisory lock), but operators should be aware of additions or table alterations before rollout.
+- **`[Requires Reindex]`** — Release alters event folding logic, fixes a previous event decoding defect, or backfills derived tables. After starting the new version, operators must run `npm run reindex` (or `docker run --env-file .env ourdao-backend node dist/indexer/reindex.js`) to re-sync derived tables with the raw event log.
+
+The `/version` endpoint reports the active build's version, commit sha, and build date:
+```bash
+curl http://localhost:4000/version
+# {"version":"0.2.0","commit":"...","buildDate":"..."}
+```
+
+### Migration policy: forward-only, backward-compatible
+
+Migrations have **no down path**. Instead, every migration must be **backward-compatible with the previous application release**: the image that ran before this one must keep working against the schema this one leaves behind. In practice that means additive changes only (new nullable or defaulted columns, new tables, new indexes) and *expand/contract* for anything else — a rename, type change, drop or tighter constraint ships as an additive step in one release and the destructive step in a later release, once no running image depends on the old shape.
+
+Each file under `src/db/migrations/` declares this on its first line (`-- compat: backward-compatible` or `-- compat: breaking (<reason>)`), and `test/migration-policy.test.ts` fails on a missing annotation or on a destructive statement (`DROP COLUMN`, `RENAME`, `ALTER COLUMN … TYPE`, `SET NOT NULL`, `ADD CONSTRAINT`, …) in a file annotated compatible. CONTRIBUTING's "Schema changes" makes this a review requirement.
+
+## Rolling back a bad deploy
+
+Migrations run automatically on boot, so starting the previous image does **not** undo the schema — the database stays at the newer version. Rolling back the image is safe exactly when every migration applied since that image's release is backward-compatible.
+
+**Procedure**
+
+1. Stop the new **worker** first (it is a singleton — see [The worker must be a singleton](#the-worker-must-be-a-singleton)), then the API instances.
+2. Check which migrations the bad release applied: `SELECT version, name, applied_at FROM schema_migrations ORDER BY version DESC;` and compare against the previous release's `src/db/migrations/` (each release entry in [CHANGELOG.md](../CHANGELOG.md) carries a `[Migration: <file>]` flag).
+3. If **none** of those migrations is listed as breaking below, start the previous image (worker, then API). It boots against the newer schema and runs unchanged. Do not delete rows from `schema_migrations`.
+4. If the release applied **any breaking migration**, do not simply roll the image back — see the table. Either roll *forward* with a fix, or restore the database (see [Backup and recovery](#backup-and-recovery): the `events` log is the only irreplaceable data, and derived tables can be rebuilt with `npm run reindex` after restoring).
+5. If the bad release changed folding logic and wrote wrong derived rows before you rolled back, run `npm run reindex` on the restored/previous image (worker stopped).
+
+**Audit of existing migrations** (against the rule above; the annotations in the files are the source of truth)
+
+| Migration | Verdict | Consequence of rolling back past it |
+|---|---|---|
+| `0001_widen_vote_columns` | **breaking** — `INTEGER` → `NUMERIC(40,0)` | A release that predates it reads `votes_*` as numbers; the column now returns strings. Never roll back past it. |
+| `0012_status_check_constraints` | **breaking** — adds `CHECK`s | A release that predates it can no longer write a status outside the set; constraints stay. |
+| `0017_approved_pending_disbursement_status` | **breaking** — widens the status `CHECK` | Rows may hold `approved_pending_disbursement`, which a release predating it does not handle. Reindex is not enough if it has already folded such rows; roll forward. |
+| `0022_failed_events_uniqueness` | **breaking** — `UNIQUE(event_id)` | A release predating it inserts into `failed_events` without `ON CONFLICT`, so a repeat failure of the same event errors on the quarantine path. |
+| `0024_auth_nonces_rekey` | **breaking** — rekeys `auth_nonces` on `nonce` | A release predating it assumes one row per address; outstanding challenges are the only data at stake, so rolling forward is the fix. |
+| `0026_failed_events_resolution_notes` | **breaking** — adds a `CHECK` on `failed_events.resolution` | No release before it writes `resolution`, so no row can violate the constraint; listed because the policy treats any new constraint as breaking. Rolling back is safe. |
+| `0027_multi_contract_cursor` | **breaking** — `indexer_cursor` keyed by `contract_id` | A release predating it reads the single `id = 1` cursor row, which no longer exists; roll forward, or restore the pre-migration cursor row before starting the old worker. |
+| `0033_multi_contract_quarantine_state` | **breaking** — `quarantine_state` keyed by `contract_id` | A release predating it assumes a single `id = 1` quarantine_state row; multi-contract deployments key quarantine state by contract_id. |
+| all others (`0002`–`0010`, `0013`, `0015`, `0016`, `0018`–`0021`, `0023`, `0025`, `0028`–`0032`, `0034`, `0035`) | backward-compatible | Additive columns/tables/indexes; safe to roll back across. |
+
+Versions `0011` and `0014` are unused (gaps are allowed; see the loader in `src/db/migrate.ts`).
+
+---
+
+## Container security and image scanning
+
+To guarantee build reproducibility and protect the production environment against base-image vulnerabilities:
+
+- **Pinned Digest Base Image**: The `Dockerfile` pins the base image by immutable SHA256 digest (`node:22-alpine@sha256:...`) rather than a mutable floating tag. Dependabot monitors Docker ecosystem updates weekly and opens PRs when updated digests are available.
+- **Vulnerability Scanning**: In CI, the `docker-build` job automatically scans the built container image with Trivy.
+- **Failure Policy**: Builds fail on any detected `HIGH` or `CRITICAL` severity vulnerability with available fixes.
+- **Allowlist Policy**: If an upstream vulnerability cannot yet be patched or represents an acceptable risk, it must be documented in [`.trivyignore`](../.trivyignore) including the CVE ID, explanation, upstream tracking link, and an expiration date.
+- **Job Summary Reporting**: Detailed scan tables are published directly to the GitHub Actions Job Summary on every run.
+
+---
+
+## Redeploying the contract
+
+The OurDAO contract has no upgrade path. Every fix is a new deployment with a new `CONTRACT_ID`. Proposal and loan ids restart at 0, so pointing an existing database at a new contract would silently merge two deployments' history.
+
+The worker detects this: it records `CONTRACT_ID` in `indexer_cursor` and refuses to start if the configured id no longer matches. You will see an error at startup.
+
+Choose one of the following recovery paths:
+
+### Option A: Fresh database (recommended)
+
+Point `DATABASE_URL` at a new, empty database. The old deployment's indexed history stays queryable in the old database. Both databases share the same schema and the same API image — you can run two API instances pointing at different databases if you need to keep the old deployment accessible.
+
+### Option B: Reuse the database
+
+Start the worker exactly once with `INDEXER_RESET_ON_CONTRACT_CHANGE=true`. This:
+
+1. Truncates the cursor and all derived tables (`members`, `loan_proposals`, `loans`, `treasury_proposals`, `notifications`).
+2. Keeps the raw `events` log intact (it is append-only by design). Events from the old contract remain in the log; use `?contract=<C...>` on `GET /api/events` and `GET /api/admin/log` to scope queries to one deployment.
+3. Re-indexes the new contract from scratch starting at `START_LEDGER`.
+
+After the first successful boot with the new contract, **unset `INDEXER_RESET_ON_CONTRACT_CHANGE`** (or set it back to `false`) before the next restart. Leaving it set means a worker restart will wipe derived state again.
+
+Running one database against two contracts simultaneously is not supported — the derived tables are single-contract by construction.
+
+---
+
+## Operations
+
+### Health and readiness probes
+
+| Endpoint | Purpose | Use as |
+|---|---|---|
+| `GET /health` | Process alive, no DB round-trip. Returns the configured `CONTRACT_ID`. | Container health check |
+| `GET /ready` | Postgres reachable + indexer cursor recently advanced. Returns `503` with a `reason` field when unhealthy. | Load-balancer readiness probe (API only) |
+
+Configure your container health check against `/health`. Use `/ready` as the readiness probe on API instances so they are removed from the load balancer when the database is down or the indexer has fallen far behind.
+
+Do not configure `/ready` as a health check on the **worker** — the worker has no HTTP server. The worker's health is observable only through the database (see below) or through process-level monitoring.
+
+### Knowing the indexer is healthy
+
+`GET /api/stats` returns two ledger values in every response:
+
+- **`lastIndexedLedger`** — the highest ledger whose events have been folded into the derived tables. This is the number that drives the data clients see.
+- **`observedTipLedger`** — the chain tip the RPC last reported. This is a freshness signal only; it is kept separate from `lastIndexedLedger` to avoid false reorg detection during catch-up.
+
+A healthy, caught-up indexer has `lastIndexedLedger` within a few ledgers of `observedTipLedger` (Stellar closes ledgers approximately every 5 seconds; a gap of ~10–20 ledgers is normal under light load).
+
+`GET /ready` returns `503` with `"reason": "indexer stale"` when the cursor has not advanced for longer than `INDEXER_STALE_AFTER_MS` (default 2 minutes). This is the automated staleness signal.
+
+### What "behind" looks like and what to do
+
+**Symptom**: `/ready` returns `503 {"reason": "indexer stale"}`, or `lastIndexedLedger` is far below `observedTipLedger`.
+
+**Check in order:**
+
+1. **Is the worker running?** A stopped or crashed worker is the most common cause. Check process/container status. The worker logs `[indexer] received SIGTERM` on a clean shutdown and `[indexer] fatal:` on a crash.
+
+2. **Is the RPC reachable?** The worker logs each poll failure. Repeated failures back off exponentially up to `POLL_MAX_BACKOFF_MS` (default 60s). A burst of RPC failures is expected to self-resolve; sustained failures indicate an RPC endpoint problem.
+
+3. **Are there quarantined events?** `GET /api/stats` reports `quarantinedEvents`. A non-zero count means the indexer encountered an event it cannot process (usually a handler bug). The worker continues indexing past quarantined events — it does not halt — but the affected derived rows may be incomplete. See `GET /api/admin/failed-events` for detail. The fix is to patch the handler and run `npm run reindex`.
+
+4. **Did the indexer halt on a reorg?** A detected reorg causes the worker to stop immediately with a loud log line (`[indexer] LEDGER DISCONTINUITY DETECTED`) and a non-zero exit; it stays halted until an operator intervenes. Confirm the chain state, then run `npm run reindex` to rebuild derived tables from the raw log. The full diagnosis-and-recovery procedure — cursor queries, triage, step-by-step recovery — is the runbook: [Reorg recovery](./REORG_RECOVERY.md).
+
+5. **Is the worker simply catching up?** After a restart or a long RPC outage, the worker may have pages of backlog to drain. `DRAIN_MAX_PAGES` and `DRAIN_MAX_MS` control how aggressively it catches up per poll cycle. During catch-up, `lastIndexedLedger` advances steadily — watch it over 30–60 seconds to confirm progress.
+
+### API serving stale data
+
+If the API is up but returning old data:
+
+1. Check `GET /api/stats` — compare `lastIndexedLedger` and `observedTipLedger`.
+2. If the indexer is caught up but data looks wrong, check `quarantinedEvents`. A handler that was quarantined left the affected derived row in the state it was in before the failing event — correct but incomplete.
+3. If `/api/stats` itself looks stale, check `STATS_CACHE_MS`. The in-process cache keeps stats results for up to that many milliseconds (default 5s). With multiple API instances the cached values may briefly disagree between instances — this is expected.
+
+### Logs
+
+Both processes log to stdout/stderr in plain text. Structured logging is not currently implemented; forward stdout to your log aggregator.
+
+Key log lines to monitor:
+
+| Pattern | Meaning |
+|---|---|
+| `[indexer] fatal:` | Worker crashed with an unhandled error — restart and investigate. |
+| `[indexer] LEDGER DISCONTINUITY DETECTED` | Reorg halt — the worker exits and stays down until an operator runs the recovery in [Reorg recovery](#reorg-recovery). |
+| `[indexer] quarantining event` | An event was moved to `failed_events` — handler bug, review `GET /api/admin/failed-events`. |
+| `[indexer] received SIGTERM` | Clean shutdown started. |
+| `[indexer] shutdown complete` | Clean shutdown finished — safe to stop the container. |
+| `CORS origin is set to *` | Wildcard CORS warning — expected if intentional, worth alerting on in production. |
+
+### Rebuilding derived state
+
+To rebuild all derived tables from the raw event log at any time:
+
+```bash
+# The worker must not be running during a reindex.
+docker run --env-file .env ourdao-backend node dist/indexer/reindex.js
+```
+
+This is safe to run at any time — it is idempotent and the result is always consistent with the raw log. It is the recovery path for reorgs, quarantined events (after fixing the handler), and any derived-table corruption. See [`docs/events-storage.md`](./events-storage.md) for expected run times at various log sizes.
+
+### Reorg recovery
+
+A full reorg alarm — what `[indexer] LEDGER DISCONTINUITY DETECTED` means, how the indexer noticed, the SQL to inspect the cursor, how to tell a real reorg from a misbehaving RPC, and the complete step-by-step recovery — has its own runbook: **[`REORG_RECOVERY.md`](./REORG_RECOVERY.md)**. Read it before improvising; the short form is "stop the worker, confirm the chain state, `npm run reindex`, restart the worker".
+
+---
+
+## Soroban RPC wire smoke testing
+
+To verify that `@stellar/stellar-sdk` and the event catalog continue to match the actual wire format returned by Soroban RPC without depending on fixtures, an opt-in smoke test is provided in `test/soroban-rpc-smoke.test.ts`.
+
+This test does not run during regular pull requests to avoid public RPC latency or rate-limiting from blocking CI, but runs on a scheduled CI workflow and can be triggered on demand.
+
+### Running against a live testnet contract
+```bash
+RUN_RPC_SMOKE=true \
+CONTRACT_ID=C... \
+SOROBAN_RPC_URL=https://soroban-testnet.stellar.org \
+npm run test:smoke
+```
+
+### Running against a local standalone network
+To smoke test in an isolated offline environment using Stellar's official standalone container:
+
+```bash
+# 1. Start local standalone network with Soroban RPC enabled
+docker run --rm -d \
+  -p 8000:8000 \
+  --name stellar-standalone \
+  stellar/quickstart:testing \
+  --standalone \
+  --enable-soroban-rpc
+
+# 2. Wait for RPC readiness
+curl -s -X POST http://localhost:8000/soroban/rpc \
+  -H "Content-Type: application/json" \
+  -d '{"jsonrpc":"2.0","id":1,"method":"getHealth"}'
+
+# 3. Deploy/invoke the contract or pass your deployed test contract id
+RUN_RPC_SMOKE=true \
+CONTRACT_ID=<DEPLOYED_CONTRACT_ID> \
+SOROBAN_RPC_URL=http://localhost:8000/soroban/rpc \
+npm run test:smoke
+
+# 4. Tear down container
+docker stop stellar-standalone
+```
+
+---
+
+## Related repos
+
+This service is one of three that make up OurDAO:
+
+| Repo | Deployment docs |
+|---|---|
+| [`ourdao-contracts`](https://github.com/ourdao/ourdao-contracts) | See that repo's README for deployment ledger — you need it for `START_LEDGER`. |
+| **`ourdao-backend`** (this repo) | This document. |
+| [`ourdao-frontend`](https://github.com/ourdao/ourdao-frontend) | Set `NEXT_PUBLIC_BACKEND_URL` to the URL of this service's API. See that repo's deployment docs for details. |
+
+The frontend and backend deployments must agree on which contract they are talking to: `CONTRACT_ID` here and the contract id configured in `ourdao-frontend` must be the same. Mismatched contract ids produce no error — the frontend will query loan and member state from a different deployment's indexed history.

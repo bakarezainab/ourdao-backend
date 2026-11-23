@@ -1,5 +1,12 @@
 import { scValToNative, type rpc, type xdr } from '@stellar/stellar-sdk'
 
+/**
+ * The @stellar/stellar-sdk version against which the event fixtures and decodeEvent
+ * wire assumptions were captured and verified (issue #206). If the installed SDK version
+ * drifts from this recorded version, wire shape compatibility must be re-verified.
+ */
+export const FIXTURE_SDK_VERSION = '16.0.1'
+
 // The complete catalog of events the OurDAO contract publishes, keyed by the
 // first-topic symbol. `fields` names the positional entries of the published
 // data tuple so downstream handlers read `data.borrower` instead of `data[1]`.
@@ -18,6 +25,20 @@ export const EVENT_FIELDS = {
   // this file; until then it decodes as `null` and handlers.ts treats that
   // as a weight of 1.
   loan_vote: ['proposal_id', 'voter', 'support', 'weight'],
+  // Published from inside loans.rs::vote_on_loan_proposal, right after the
+  // vote that pushes the proposal past quorum, when the treasury can't cover
+  // the disbursement yet (approve_and_disburse fails). The contract has
+  // already moved the proposal to ApprovedPendingDisbursement — that state
+  // was previously invisible off-chain (issue #125). A later permissionless
+  // `disburse_approved_loan` call resolves it and republishes `loan_appr`,
+  // which the existing handler below already folds unconditionally.
+  loan_wait: ['id', 'amount'],
+  // Published from the same function when the votes still outstanding can no
+  // longer mathematically reach quorum — an early rejection, distinct from
+  // `loan_exp`'s permissionless-keeper-call-after-the-window path below.
+  // `for_votes`/`against_votes` are the contract's final stake-weighted tally
+  // at the moment of rejection (issue #124).
+  loan_rej: ['id', 'for_votes', 'against_votes'],
   // `id` here is the disbursed loan's id, which the contract deliberately
   // reuses as the originating proposal's id (loans.rs::approve_and_disburse
   // sets `id = proposal.id` rather than drawing from a separate counter) —
@@ -31,9 +52,26 @@ export const EVENT_FIELDS = {
   loan_appr: ['id', 'borrower', 'amount', 'due_time'],
   loan_rpy: ['loan_id', 'borrower', 'outstanding'],
   loan_dflt: ['loan_id', 'borrower', 'penalty'],
+  // Permissionless keeper call that transitions a loan proposal whose voting
+  // window closed without reaching quorum. Fields match the contract's
+  // publish order in loans.rs::expire_loan_proposal exactly:
+  // env.events().publish((symbol_short!("loan_exp"),), (proposal_id, proposal.borrower)).
+  // The contract doc says it "succeeds exactly once per proposal — subsequent
+  // calls are a no-op (no double event)", so re-delivery is safe to guard at
+  // the DB level (WHERE status = 'pending').
+  // Introduced in ourdao-contracts @ the commit that added expire_loan_proposal
+  // (loans.rs). Fixes issue #38.
+  loan_exp: ['proposal_id', 'borrower'],
   interest: ['interest', 'active'],
   tre_prop: ['id', 'amount', 'destination', 'private'],
   tre_vote: ['id', 'voter', 'support', 'weight'],
+  // Treasury equivalent of `loan_wait` above — published from treasury.rs's
+  // vote-tally path when the proposal reaches quorum but `execute` fails
+  // because the treasury can't cover it yet (issue #125). A later
+  // `execute_treasury_proposal` call resolves it and republishes `tre_exec`.
+  tre_wait: ['id', 'amount'],
+  // Treasury equivalent of `loan_rej` above (issue #124).
+  tre_rej: ['id', 'for_votes', 'against_votes'],
   tre_exec: ['id', 'amount', 'destination'],
   staked: ['member', 'amount', 'new_stake'],
   unstaked: ['member', 'amount', 'new_stake'],
@@ -63,9 +101,12 @@ export const LOAN_TIMELINE_SYMBOLS = [
   'loan_req',
   'loan_edit',
   'loan_vote',
+  'loan_wait',
+  'loan_rej',
   'loan_appr',
   'loan_rpy',
   'loan_dflt',
+  'loan_exp',
 ] as const
 
 /** Treasury proposal lifecycle event symbols (issue #26). The proposal id is
@@ -77,6 +118,8 @@ export const TREASURY_TIMELINE_SYMBOLS = [
   'tre_vote',
   'committed',
   'revealed',
+  'tre_wait',
+  'tre_rej',
   'tre_exec',
 ] as const
 
@@ -100,6 +143,7 @@ export const MEMBER_ACTIVITY_SYMBOLS = [
   'loan_appr',
   'loan_rpy',
   'loan_dflt',
+  'loan_exp',
   'tre_vote',
   'committed',
   'revealed',
@@ -132,6 +176,7 @@ export interface DecodedEvent {
   data: unknown[]
   /** Named view of `data` when the symbol is in the catalog. */
   fields: Record<string, unknown>
+  decodeError?: string | null
 }
 
 /** Recursively convert bigints to strings so values survive JSON/JSONB. */
@@ -146,11 +191,13 @@ export function toJsonSafe(v: unknown): unknown {
   return v
 }
 
-function safeNative(scv: xdr.ScVal): unknown {
+function safeNative(scv: xdr.ScVal, evInfo: { id: string, ledger: number }, pos: string): { val: unknown; err?: string } {
   try {
-    return toJsonSafe(scValToNative(scv))
-  } catch {
-    return null
+    return { val: toJsonSafe(scValToNative(scv)) }
+  } catch (e) {
+    const msg = e instanceof Error ? e.message : String(e)
+    console.error(`[events] decode error at ledger ${evInfo.ledger}, event ${evInfo.id}, ${pos}: ${msg}`)
+    return { val: null, err: msg }
   }
 }
 
@@ -203,10 +250,21 @@ export function isKnownSymbol(symbol: string): symbol is EventSymbol {
 
 /** Decode one getEvents response entry into a JSON-safe DecodedEvent. */
 export function decodeEvent(ev: rpc.Api.EventResponse): DecodedEvent {
-  const topics = (ev.topic ?? []).map(safeNative)
-  const symbol = typeof topics[0] === 'string' ? topics[0] : String(topics[0] ?? '')
+  const evInfo = { id: ev.id, ledger: ev.ledger }
+  let decodeError: string | null = null
+  const topics: unknown[] = []
+  
+  ;(ev.topic ?? []).forEach((t, i) => {
+    const res = safeNative(t, evInfo, `topic ${i}`)
+    if (res.err && !decodeError) decodeError = res.err
+    topics.push(res.val)
+  })
 
-  const nativeValue = safeNative(ev.value)
+  const symbol = typeof topics[0] === 'string' && topics[0] !== '' ? topics[0] : String(topics[0] ?? '')
+
+  const dataRes = safeNative(ev.value, evInfo, 'data')
+  if (dataRes.err && !decodeError) decodeError = dataRes.err
+  const nativeValue = dataRes.val
   const data = Array.isArray(nativeValue) ? nativeValue : [nativeValue]
 
   const fields = namedFields(symbol, data)
@@ -221,5 +279,6 @@ export function decodeEvent(ev: rpc.Api.EventResponse): DecodedEvent {
     topics,
     data,
     fields,
+    decodeError,
   }
 }

@@ -1,41 +1,285 @@
 import { Keypair, StrKey, MuxedAccount } from '@stellar/stellar-sdk'
+import { logger, formatAddress } from './lib/logger.js'
 import { randomBytes } from 'crypto'
 import type { Pool } from 'pg'
+import { config } from './config.js'
+
+/** Hex width of the millisecond timestamp prefix (12 digits holds epoch ms until year 10889). */
+export const NONCE_TIMESTAMP_HEX_LEN = 12
+/** Random bytes after the prefix, so prefix + random is 64 hex chars. */
+const NONCE_RANDOM_BYTES = 26
+const MAX_NONCES_PER_ADDRESS = 100
+
+// Authentication failure counters (issue #183, #403)
+export const authStats = {
+  challengesIssued: 0,
+  verificationsSucceeded: 0,
+  verificationsFailed: {
+    missingHeaders: 0,
+    invalidNonce: 0,
+    invalidSignature: 0,
+    addressMismatch: 0,
+    malformedEncoding: 0,
+    unsupportedAddressType: 0,
+  },
+}
+
+export function getAuthStats() {
+  return {
+    challengesIssued: authStats.challengesIssued,
+    verificationsSucceeded: authStats.verificationsSucceeded,
+    verificationsFailed: { ...authStats.verificationsFailed },
+  }
+}
+
+export function resetAuthStats(): void {
+  authStats.challengesIssued = 0
+  authStats.verificationsSucceeded = 0
+  authStats.verificationsFailed.missingHeaders = 0
+  authStats.verificationsFailed.invalidNonce = 0
+  authStats.verificationsFailed.invalidSignature = 0
+  authStats.verificationsFailed.addressMismatch = 0
+  authStats.verificationsFailed.malformedEncoding = 0
+  authStats.verificationsFailed.unsupportedAddressType = 0
+}
+
+/**
+ * Throttling Architecture and Defense-in-Depth (Issues #184, #507):
+ *
+ * 1. What the IP-based rate limiter protects against:
+ *    Global and per-route `@fastify/rate-limit` (with a stricter limit on
+ *    GET /api/auth/challenge and GET /api/events) protects network and server
+ *    infrastructure against high-volume traffic floods, Denial of Service (DoS),
+ *    and automated scrapers. It operates at the network layer, keyed by client IP.
+ *
+ * 2. What the per-address failure tracker (AuthFailureTracker) protects against:
+ *    `AuthFailureTracker` protects cryptographic identities (Stellar addresses)
+ *    against targeted brute-force attacks (e.g. signature guessing or nonce-spray
+ *    attacks) that may be distributed across many IPs (botnets, rotating proxies)
+ *    where IP-based rate limiting alone is ineffective.
+ *
+ * 3. Why these mechanisms have different keys and scopes:
+ *    - IP rate limiting is keyed on client IP (`req.ip`), scoped to network origin.
+ *      It bounds raw resource consumption per machine/NAT gateway.
+ *    - Auth failure backoff is keyed on Stellar public address (`address`),
+ *      scoped to account identity. It applies exponential delay (1s, 2s, 4s, ... up
+ *      to 60s) specifically after failed signature verifications or invalid nonces.
+ *
+ * 4. How legitimate signature retries should behave:
+ *    A legitimate client with the correct private key signs the issued nonce and
+ *    succeeds on verification, triggering `recordSuccess(address)`, which clears
+ *    any accrued failure records. If a transient error occurs (e.g., client clock
+ *    skew or network timeout leading to nonce expiration), the client may retry
+ *    after any active backoff window expires; legitimate retries with valid signatures
+ *    do not accumulate repeated failures.
+ *
+ * 5. Whether challenge issuance affects the failure tracker's state:
+ *    No. Challenge issuance (`GET /api/auth/challenge?address=...`) does NOT affect
+ *    or advance `AuthFailureTracker` state. Challenges are unauthenticated reads.
+ *    If requesting a challenge recorded a failure or advanced backoff, an attacker
+ *    could trivially lock out any arbitrary victim address without possessing their
+ *    private key (pre-auth DoS). Challenge issuance is protected exclusively by IP
+ *    rate limiting and per-address outstanding nonce caps (`MAX_NONCES_PER_ADDRESS`).
+ *
+ * 6. Information exposure considerations:
+ *    `GET /api/auth/challenge` never reveals whether an address is under backoff.
+ *    Only an authenticated endpoint (`authenticateRequest`) returns HTTP 429
+ *    ("Too many failed attempts. Try again in X seconds") when an address is
+ *    currently backed off. While this does reveal that the address recently incurred
+ *    verification failures, it leaks no private keys or nonce contents.
+ *
+ * Discovered Gap & Follow-up Note:
+ *    Challenge issuance (`GET /api/auth/challenge`) is tracked per-IP by
+ *    `@fastify/rate-limit` and capped at `MAX_NONCES_PER_ADDRESS` (100) per address
+ *    in `NonceStore`, but does not feed into `AuthFailureTracker`. An attacker rotating
+ *    many distributed IPs could exhaust the 100 outstanding nonce slots for a victim
+ *    address, causing subsequent challenge requests to return 503 NonceStoreCapacityError
+ *    until existing nonces expire (5 min TTL). As noted above, tying challenge issuance
+ *    to `AuthFailureTracker` would create an even worse vulnerability (trivial 429 lockout).
+ *    A recommended future hardening measure is to add per-address sliding-window challenge
+ *    issuance limits decoupled from verification backoff.
+ */
+// Per-address failure tracking for exponential backoff (issue #184)
+interface FailureRecord {
+  count: number
+  lastFailureAt: number
+  nextAllowedAt: number
+}
+
+export class AuthFailureTracker {
+  private failures = new Map<string, FailureRecord>()
+  private readonly BASE_BACKOFF_MS = 1000 // 1 second
+  private readonly MAX_BACKOFF_MS = 60000 // 1 minute
+  private readonly FAILURE_WINDOW_MS = 300000 // 5 minutes
+  private readonly MAX_CAPACITY = 10000 // LRU capacity
+  private cleanupTimer: NodeJS.Timeout | null = null
+
+  constructor() {
+    // Clean up old failure records every minute (issue #258)
+    this.cleanupTimer = setInterval(() => {
+      const now = Date.now()
+      for (const [address, record] of this.failures.entries()) {
+        // Original cleanup: evict if last failure was more than FAILURE_WINDOW_MS ago
+        const staleSinceLastFailure = record.lastFailureAt < now - this.FAILURE_WINDOW_MS
+        // Issue #258: also evict if backoff expired more than 1 hour ago
+        const staleAfterBackoff = now > record.nextAllowedAt + 3600000
+        if (staleSinceLastFailure || staleAfterBackoff) {
+          this.failures.delete(address)
+        }
+      }
+    }, 60000)
+    if (this.cleanupTimer.unref) {
+      this.cleanupTimer.unref()
+    }
+  }
+
+  shutdown(): void {
+    if (this.cleanupTimer) {
+      clearInterval(this.cleanupTimer)
+      this.cleanupTimer = null
+    }
+  }
+
+  /** Check if an authentication attempt is allowed for this address */
+  isAllowed(address: string): boolean {
+    const record = this.failures.get(address)
+    if (!record) return true
+    return Date.now() >= record.nextAllowedAt
+  }
+
+  /** Get remaining backoff time in milliseconds, or 0 if allowed */
+  getRemainingBackoff(address: string): number {
+    const record = this.failures.get(address)
+    if (!record) return 0
+    const remaining = record.nextAllowedAt - Date.now()
+    return Math.max(0, remaining)
+  }
+
+  /** Record a failed authentication attempt and calculate new backoff */
+  recordFailure(address: string): void {
+    const now = Date.now()
+    const existing = this.failures.get(address)
+    
+    // Issue #258: enforce LRU capacity to prevent unbounded memory growth
+    if (!existing && this.failures.size >= this.MAX_CAPACITY) {
+      // Find and evict the oldest entry by nextAllowedAt
+      let oldestKey: string | null = null
+      let oldestTime = Infinity
+      for (const [key, record] of this.failures.entries()) {
+        if (record.nextAllowedAt < oldestTime) {
+          oldestTime = record.nextAllowedAt
+          oldestKey = key
+        }
+      }
+      if (oldestKey !== null) {
+        this.failures.delete(oldestKey)
+      }
+    }
+    
+    if (existing && now - existing.lastFailureAt < this.FAILURE_WINDOW_MS) {
+      // Within failure window - increment count and increase backoff
+      const newCount = existing.count + 1
+      // Exponential backoff: 2^(count-1) * BASE_BACKOFF_MS, capped at MAX
+      const backoffMs = Math.min(
+        Math.pow(2, newCount - 1) * this.BASE_BACKOFF_MS,
+        this.MAX_BACKOFF_MS
+      )
+      this.failures.set(address, {
+        count: newCount,
+        lastFailureAt: now,
+        nextAllowedAt: now + backoffMs,
+      })
+    } else {
+      // First failure or outside window - reset to base backoff
+      this.failures.set(address, {
+        count: 1,
+        lastFailureAt: now,
+        nextAllowedAt: now + this.BASE_BACKOFF_MS,
+      })
+    }
+  }
+
+  /** Clear failure record on successful authentication */
+  recordSuccess(address: string): void {
+    this.failures.delete(address)
+  }
+}
+
+// Minimal structural subset of the Fastify/Pino logger — just what auth needs
+// to log through the request's logger instead of `console.*` (issue #132),
+// so `LOG_LEVEL` applies and log lines carry the request correlation id.
+export interface AuthLogger {
+  debug(msg: string): void
+  warn(msg: string): void
+  error(msg: string): void
+  info(msg: string): void
+}
+
+// Typed error for nonce store capacity exceeded (issue #135)
+export class NonceStoreCapacityError extends Error {
+  constructor(message: string = 'Nonce store capacity exceeded') {
+    super(message)
+    this.name = 'NonceStoreCapacityError'
+  }
+}
 
 // Nonce storage interface - in production this would use Redis or similar
+export interface LoggerLike {
+  debug(msg: string): void
+}
+
 export interface NonceStore {
-  issue(address: string): Promise<string>
+  issue(address: string, log?: LoggerLike): Promise<string>
   consume(address: string, nonce: string): Promise<boolean>
+  shutdown(): Promise<void>
+}
+
+// A member's address is their on-chain identity — logging it in full on every
+// request links identity to request timing (issue #133). Truncate the way a
+// block explorer does (first 4 / last 4 chars) so debug output stays useful
+// for eyeballing without writing the full address to disk on every request.
+function truncateAddress(address: string): string {
+  if (address.length <= 10) return address
+  return `${address.slice(0, 4)}…${address.slice(-4)}`
 }
 
 // In-memory nonce store for development
 export class MemoryNonceStore implements NonceStore {
-  private store = new Map<string, { nonce: string; expiresAt: number }>()
-  private readonly TTL_MS = 5 * 60 * 1000 // 5 minutes
-  private readonly MAX_ENTRIES = 10000 // Hard cap on stored entries
+  // Issue #180: support multiple nonces per address by keying on the nonce itself
+  private store = new Map<string, { address: string; expiresAt: number }>()
+  private addressIssueCounts = new Map<string, number>()
+  private readonly ttlMs: number
+  private readonly maxEntries: number
+  private readonly sweepIntervalMs: number
   private sweepTimer: NodeJS.Timeout | null = null
+  // Max outstanding nonces per address (issue #180)
+  private readonly maxNoncesPerAddress = MAX_NONCES_PER_ADDRESS
 
   constructor() {
-    // Start periodic sweep of expired entries, unref'd so it doesn't hold process open
+    this.ttlMs = config.db.nonceTtlMs
+    this.maxEntries = config.db.nonceMaxEntries
+    this.sweepIntervalMs = config.db.nonceSweepIntervalMs
     this.startSweep()
   }
 
   private startSweep(): void {
-    // Sweep every minute to clean up expired entries
     this.sweepTimer = setInterval(() => {
       const now = Date.now()
       let evictedCount = 0
-      for (const [key, entry] of this.store.entries()) {
+      for (const [nonce, entry] of this.store.entries()) {
         if (entry.expiresAt < now) {
-          this.store.delete(key)
+          this.store.delete(nonce)
+          // Decrement issue count for this address
+          const count = this.addressIssueCounts.get(entry.address) ?? 0
+          if (count > 1) {
+            this.addressIssueCounts.set(entry.address, count - 1)
+          } else {
+            this.addressIssueCounts.delete(entry.address)
+          }
           evictedCount++
         }
       }
-      if (evictedCount > 0) {
-        // Could log this if needed: console.debug(`MemoryNonceStore: evicted ${evictedCount} expired entries`)
-      }
-    }, 60 * 1000) // Every minute
-    // Unref the timer so it doesn't prevent graceful shutdown
+    }, this.sweepIntervalMs)
     if (this.sweepTimer.unref) {
       this.sweepTimer.unref()
     }
@@ -48,31 +292,62 @@ export class MemoryNonceStore implements NonceStore {
     }
   }
 
-  async issue(address: string): Promise<string> {
-    // Generate a random 32-byte nonce (64 hex chars)
-    const nonce = randomBytes(32).toString('hex')
-    
-    // If we're at capacity, reject new challenges to prevent DoS
-    if (this.store.size >= this.MAX_ENTRIES) {
-      throw new Error('Nonce store capacity exceeded')
+  async issue(address: string, log?: LoggerLike): Promise<string> {
+    // Check if we're at overall capacity to prevent DoS
+    if (this.store.size >= this.maxEntries) {
+      throw new NonceStoreCapacityError()
     }
-    
-    this.store.set(address, {
-      nonce,
-      expiresAt: Date.now() + this.TTL_MS
+
+    // Check per-address nonce limit (issue #180)
+    const addressIssueCount = this.addressIssueCounts.get(address) ?? 0
+    if (addressIssueCount >= this.maxNoncesPerAddress) {
+      throw new NonceStoreCapacityError(`Too many outstanding nonces for ${truncateAddress(address)}`)
+    }
+
+    // Issue #266: Generate a timestamp-prefixed nonce (12 hex chars timestamp + 52 hex chars random = 64)
+    // to enable early expiration checks without hitting the database
+    const timestamp = Date.now()
+    const timestampHex = timestamp.toString(16).padStart(NONCE_TIMESTAMP_HEX_LEN, '0')
+    const randomHex = randomBytes(NONCE_RANDOM_BYTES).toString('hex')
+    const nonce = timestampHex + randomHex
+
+    this.store.set(nonce, {
+      address,
+      expiresAt: Date.now() + this.ttlMs
     })
+
+    // Track issue count per address
+    this.addressIssueCounts.set(address, addressIssueCount + 1)
+    authStats.challengesIssued++
+
+    logger?.debug(`[auth] Issued nonce for ${truncateAddress(address)} (${addressIssueCount + 1} outstanding)`)
+
     return nonce
   }
 
   async consume(address: string, nonce: string): Promise<boolean> {
-    const entry = this.store.get(address)
+    const entry = this.store.get(nonce)
     if (!entry) return false
     if (entry.expiresAt < Date.now()) {
-      this.store.delete(address)
+      this.store.delete(nonce)
+      // Decrement issue count
+      const count = this.addressIssueCounts.get(address) ?? 0
+      if (count > 1) {
+        this.addressIssueCounts.set(address, count - 1)
+      } else {
+        this.addressIssueCounts.delete(address)
+      }
       return false
     }
-    if (entry.nonce !== nonce) return false
-    this.store.delete(address)
+    if (entry.address !== address) return false
+    this.store.delete(nonce)
+    // Decrement issue count
+    const count = this.addressIssueCounts.get(address) ?? 0
+    if (count > 1) {
+      this.addressIssueCounts.set(address, count - 1)
+    } else {
+      this.addressIssueCounts.delete(address)
+    }
     return true
   }
 }
@@ -82,16 +357,22 @@ export class MemoryNonceStore implements NonceStore {
 // even with concurrent requests across multiple API instances.
 export class PostgresNonceStore implements NonceStore {
   private pool: Pool
-  private readonly TTL_MS = 5 * 60 * 1000 // 5 minutes
+  private ttlMs: number
+  private cleanupIntervalMs: number
   private cleanupTimer: NodeJS.Timeout | null = null
+  // Background timer, not tied to any one request — falls back to this
+  // base logger (e.g. `app.log`) rather than the per-call logger `issue()` gets.
+  private readonly logger?: AuthLogger
 
-  constructor(pool: Pool) {
+  constructor(pool: Pool, logger?: AuthLogger) {
     this.pool = pool
+    this.logger = logger
+    this.ttlMs = config.db.nonceTtlMs
+    this.cleanupIntervalMs = config.db.nonceSweepIntervalMs
     this.startCleanup()
   }
 
   private startCleanup(): void {
-    // Clean up expired nonces every 10 minutes
     this.cleanupTimer = setInterval(async () => {
       try {
         await this.pool.query(
@@ -99,9 +380,9 @@ export class PostgresNonceStore implements NonceStore {
         )
       } catch (error) {
         // Log but don't throw - cleanup failure shouldn't crash the process
-        console.warn(`[auth] expired-nonce cleanup failed: ${(error as Error).message}`)
+        this.logger?.warn(`[auth] expired-nonce cleanup failed: ${(error as Error).message}`)
       }
-    }, 10 * 60 * 1000) // Every 10 minutes
+    }, this.cleanupIntervalMs)
     // Unref the timer so it doesn't prevent graceful shutdown
     if (this.cleanupTimer.unref) {
       this.cleanupTimer.unref()
@@ -115,29 +396,60 @@ export class PostgresNonceStore implements NonceStore {
     }
   }
 
-  async issue(address: string): Promise<string> {
-    const nonce = randomBytes(32).toString('hex')
-    const expiresAt = new Date(Date.now() + this.TTL_MS)
+  async issue(address: string, log?: LoggerLike): Promise<string> {
+    const counts = await this.pool.query<{ total: string; address_total: string }>(
+      `SELECT
+         COUNT(*) FILTER (WHERE expires_at > now()) AS total,
+         COUNT(*) FILTER (WHERE expires_at > now() AND address = $1) AS address_total
+       FROM auth_nonces`,
+      [address]
+    )
+    const count = counts.rows[0]
+    if (count && Number(count.total) >= config.db.nonceMaxEntries) {
+      throw new NonceStoreCapacityError()
+    }
+    if (count && Number(count.address_total) >= MAX_NONCES_PER_ADDRESS) {
+      throw new NonceStoreCapacityError(`Too many outstanding nonces for ${truncateAddress(address)}`)
+    }
 
-    // Insert the nonce. If an address already has a nonce, replace it (UPSERT via ON CONFLICT)
-    await this.pool.query(
-      `INSERT INTO auth_nonces (address, nonce, expires_at) 
+    // Issue #179: make this atomic to prevent concurrent challenges clobbering each other.
+    // A single INSERT statement avoids the race between SELECT and INSERT that allowed
+    // two concurrent requests to both generate and store nonces. With nonce as the
+    // primary key (issue #180), each call gets a distinct nonce stored atomically.
+    const expiresAt = new Date(Date.now() + this.ttlMs)
+    // Issue #266: Generate a timestamp-prefixed nonce (12 hex chars timestamp + 52 hex chars random = 64)
+    // to enable early expiration checks without hitting the database
+    const timestamp = Date.now()
+    const timestampHex = timestamp.toString(16).padStart(NONCE_TIMESTAMP_HEX_LEN, '0')
+    const randomHex = randomBytes(NONCE_RANDOM_BYTES).toString('hex')
+    const nonce = timestampHex + randomHex
+
+    // Insert the new nonce. Each nonce is unique, so this is atomic and race-free.
+    const result = await this.pool.query(
+      `INSERT INTO auth_nonces (nonce, address, expires_at)
        VALUES ($1, $2, $3)
-       ON CONFLICT (address) DO UPDATE 
-       SET nonce = $2, expires_at = $3`,
-      [address, nonce, expiresAt]
+       RETURNING nonce`,
+      [nonce, address, expiresAt]
     )
 
+    if (result.rows.length > 0) {
+      authStats.challengesIssued++
+      logger?.debug(`[auth] Issued nonce for ${truncateAddress(address)}`)
+      return result.rows[0].nonce
+    }
+
+    // Should not reach here, but fall back to the generated nonce if insert failed
+    authStats.challengesIssued++
     return nonce
   }
 
   async consume(address: string, nonce: string): Promise<boolean> {
     // Atomically: DELETE the row if it exists, not expired, and nonce matches
     const result = await this.pool.query(
-      `DELETE FROM auth_nonces 
-       WHERE address = $1 AND nonce = $2 AND expires_at > now()
-       RETURNING address`,
-      [address, nonce]
+      `DELETE FROM auth_nonces
+       WHERE nonce = $1 AND address = $2 AND expires_at > now()
+       RETURNING nonce`,
+      [nonce, address]
     )
 
     // If a row was deleted, the nonce was valid
@@ -170,11 +482,14 @@ const ED25519_SIGNATURE_BYTES = 64
 export function verifySignature(
   address: string,
   nonce: string,
-  signature: string
+  signature: string,
+  logger?: AuthLogger
 ): SignatureResult {
   const type = classifyStellarAddress(address)
 
   if (type === 'invalid') {
+    logger?.warn(`[auth] verification failed: reason=unsupported_address_type address=${truncateAddress(address)}`)
+    authStats.verificationsFailed.unsupportedAddressType++
     return { ok: false, status: 400, error: 'Unrecognized Stellar address format' }
   }
 
@@ -183,6 +498,8 @@ export function verifySignature(
   // ed25519 signature at all. Unsupported here; see README "Security notes".
   // Follow-up for `__check_auth` verification: tracked separately.
   if (type === 'contract') {
+    logger?.warn(`[auth] verification failed: reason=unsupported_address_type address=${truncateAddress(address)} type=contract`)
+    authStats.verificationsFailed.unsupportedAddressType++
     return {
       ok: false,
       status: 400,
@@ -198,7 +515,8 @@ export function verifySignature(
     try {
       ed25519Address = MuxedAccount.fromAddress(address, '0').baseAccount().accountId()
     } catch (error) {
-      console.warn(`[auth] could not resolve muxed address ${address}: ${(error as Error).message}`)
+      logger?.warn(`[auth] verification failed: reason=malformed_muxed_address address=${truncateAddress(address)}`)
+      authStats.verificationsFailed.unsupportedAddressType++
       return { ok: false, status: 400, error: 'Malformed muxed (M…) address' }
     }
   }
@@ -209,9 +527,10 @@ export function verifySignature(
   // encoding, logged distinctly from a valid-but-wrong signature.
   const signatureBuffer = Buffer.from(signature, 'base64')
   if (signatureBuffer.length !== ED25519_SIGNATURE_BYTES) {
-    console.warn(
-      `[auth] signature for ${address} decoded to ${signatureBuffer.length} bytes (expected ${ED25519_SIGNATURE_BYTES}) — malformed base64`
+    logger?.warn(
+      `[auth] verification failed: reason=malformed_encoding address=${truncateAddress(address)} decoded_bytes=${signatureBuffer.length} expected=${ED25519_SIGNATURE_BYTES}`
     )
+    authStats.verificationsFailed.malformedEncoding++
     return { ok: false, status: 401, error: 'Invalid signature' }
   }
 
@@ -219,12 +538,16 @@ export function verifySignature(
   try {
     const keypair = Keypair.fromPublicKey(ed25519Address)
     if (!keypair.verify(data, signatureBuffer)) {
-      console.warn(`[auth] signature verification failed for ${address} (well-formed, wrong signature or key)`)
+      logger?.warn(`[auth] verification failed: reason=invalid_signature address=${truncateAddress(address)}`)
+      authStats.verificationsFailed.invalidSignature++
       return { ok: false, status: 401, error: 'Invalid signature' }
     }
+    logger?.info(`[auth] verification succeeded: address=${truncateAddress(address)}`)
+    authStats.verificationsSucceeded++
     return { ok: true, ed25519Address }
   } catch (error) {
-    console.warn(`[auth] unexpected error verifying signature for ${address}: ${(error as Error).message}`)
+    logger?.warn(`[auth] verification failed: reason=invalid_signature address=${truncateAddress(address)} error=${(error as Error).message}`)
+    authStats.verificationsFailed.invalidSignature++
     return { ok: false, status: 401, error: 'Invalid signature' }
   }
 }
@@ -271,37 +594,66 @@ export function isValidStellarAddress(address: string): boolean {
  * actually authenticated, never a separately re-parsed one (issue #70).
  */
 export type AuthResult =
-  | { authenticated: false; status: number; error: string }
-  | { authenticated: true; address: string }
+  | { authenticated: false; error: string; status: number }
+  | { authenticated: true; address: string; ed25519Address: string }
 
 // Authentication middleware function
 export async function authenticateRequest(
   headers: Record<string, unknown>,
   nonceStore: NonceStore,
-  targetAddress?: string
+  targetAddress?: string,
+  logger?: AuthLogger,
+  failureTracker?: AuthFailureTracker
 ): Promise<AuthResult> {
   const { address, signature, nonce } = extractAuthHeaders(headers)
 
   if (!address || !signature || !nonce) {
+    logger?.warn(`[auth] authentication failed: reason=missing_headers has_address=${!!address} has_signature=${!!signature} has_nonce=${!!nonce}`)
+    authStats.verificationsFailed.missingHeaders++
     return { authenticated: false, status: 401, error: 'Missing authentication headers' }
+  }
+
+  // Check if this address is currently under backoff (issue #184, #507)
+  if (failureTracker && !failureTracker.isAllowed(address)) {
+    const backoffMs = failureTracker.getRemainingBackoff(address)
+    logger?.warn(`[auth] authentication blocked: reason=backoff address=${truncateAddress(address)} backoff_ms=${backoffMs}`)
+    return {
+      authenticated: false,
+      status: 429,
+      error: `Too many failed attempts. Try again in ${Math.ceil(backoffMs / 1000)} seconds`,
+    }
+  }
+
+  // Verify the signature first. A bogus request must not consume the nonce,
+  // otherwise an attacker can burn a victim's live challenge and lock them out
+  // (issue #115). The nonce is only consumed once the signature is valid.
+  const sig = verifySignature(address, nonce, signature, logger)
+  if (!sig.ok) {
+    failureTracker?.recordFailure(address)
+    return { authenticated: false, status: sig.status, error: sig.error }
   }
 
   // Check if the nonce is valid and hasn't been used
   const nonceValid = await nonceStore.consume(address, nonce)
   if (!nonceValid) {
+    logger?.warn(`[auth] authentication failed: reason=invalid_nonce address=${truncateAddress(address)}`)
+    authStats.verificationsFailed.invalidNonce++
+    failureTracker?.recordFailure(address)
     return { authenticated: false, status: 401, error: 'Invalid or expired nonce' }
   }
 
-  // Verify the signature
-  const sig = verifySignature(address, nonce, signature)
-  if (!sig.ok) {
-    return { authenticated: false, status: sig.status, error: sig.error }
-  }
-
-  // If a target address is provided, ensure it matches the authenticated address
+  // If a target address is provided, ensure it matches the authenticated address.
+  // 403, not 401 — the caller *is* authenticated, they're just not authorized
+  // to act on another address, and this must match the ownership check in
+  // PATCH /notifications/:id/read for the same condition (issue #134).
   if (targetAddress && targetAddress !== address) {
-    return { authenticated: false, status: 401, error: 'Cannot modify notifications for another address' }
+    logger?.warn(`[auth] authentication failed: reason=address_mismatch authenticated=${truncateAddress(address)} target=${truncateAddress(targetAddress)}`)
+    authStats.verificationsFailed.addressMismatch++
+    // Don't count address mismatch toward backoff — it's not a brute-force attempt
+    return { authenticated: false, status: 403, error: 'Cannot modify notifications for another address' }
   }
 
-  return { authenticated: true, address }
+  logger?.info(`[auth] authentication succeeded: address=${truncateAddress(address)}`)
+  failureTracker?.recordSuccess(address)
+  return { authenticated: true, address, ed25519Address: sig.ed25519Address }
 }

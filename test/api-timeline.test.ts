@@ -72,6 +72,43 @@ describe('API: per-entity event timelines (issue #26)', () => {
       expect(timeline.map((e: { ledger: number }) => e.ledger)).toEqual([10, 20, 30, 40, 50, 60])
     })
 
+    it('reports truncated: false and the full total for a lifecycle under TIMELINE_MAX_ROWS (issue #586)', async () => {
+      await ev(10, 'loan_req', [7, BORROWER, '500', '550'])
+      await ev(20, 'loan_vote', [7, VOTER_A, true, null])
+
+      const { truncated, total } = (await app.inject({ method: 'GET', url: '/api/loans/7/timeline' })).json()
+      expect(truncated).toBe(false)
+      expect(total).toBe(2)
+    })
+
+    it('reports truncated: true and the full total when more than TIMELINE_MAX_ROWS events match (issue #586)', async () => {
+      const LOAN_ID = 55
+      const TOTAL_EVENTS = 2001 // one above the TIMELINE_MAX_ROWS cap (2000)
+      // Bulk-inserted via generate_series — 2001 individual ev() round trips
+      // would make this test needlessly slow.
+      await query(
+        `INSERT INTO events (id, ledger, closed_at, contract_id, symbol, topics, data, tx_hash)
+         SELECT
+           lpad(g::text, 10, '0') || '-0000000000',
+           g,
+           to_timestamp(1700000000 + g),
+           'CTEST',
+           'loan_vote',
+           '["loan_vote"]'::jsonb,
+           jsonb_build_array($1::int, 'VOTER' || g, true, null),
+           'tx-' || g
+         FROM generate_series(1, $2) g`,
+        [LOAN_ID, TOTAL_EVENTS]
+      )
+
+      const res = await app.inject({ method: 'GET', url: `/api/loans/${LOAN_ID}/timeline` })
+      expect(res.statusCode).toBe(200)
+      const body = res.json()
+      expect(body.timeline).toHaveLength(2000)
+      expect(body.truncated).toBe(true)
+      expect(body.total).toBe(TOTAL_EVENTS)
+    })
+
     it('returns decoded named fields, not raw JSONB', async () => {
       await ev(10, 'loan_req', [7, BORROWER, '500', '550'])
       const { timeline } = (await app.inject({ method: 'GET', url: '/api/loans/7/timeline' })).json()
@@ -90,7 +127,7 @@ describe('API: per-entity event timelines (issue #26)', () => {
     it('returns an empty timeline (200, not 404) for an id with no events', async () => {
       const res = await app.inject({ method: 'GET', url: '/api/loans/999/timeline' })
       expect(res.statusCode).toBe(200)
-      expect(res.json()).toEqual({ timeline: [] })
+      expect(res.json()).toEqual({ timeline: [], truncated: false, total: 0 })
     })
 
     it('does not leak events from other loans', async () => {
@@ -153,7 +190,7 @@ describe('API: per-entity event timelines (issue #26)', () => {
     it('returns an empty timeline (200) for an unknown proposal id', async () => {
       const res = await app.inject({ method: 'GET', url: '/api/proposals/treasury/42/timeline' })
       expect(res.statusCode).toBe(200)
-      expect(res.json()).toEqual({ timeline: [] })
+      expect(res.json()).toEqual({ timeline: [], truncated: false, total: 0 })
     })
   })
 

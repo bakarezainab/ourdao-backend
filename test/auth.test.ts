@@ -1,4 +1,5 @@
 import { afterEach, describe, expect, it, vi } from 'vitest'
+import { config } from '../src/config.js'
 import { Account, Keypair, MuxedAccount, StrKey } from '@stellar/stellar-sdk'
 import {
   authenticateRequest,
@@ -6,7 +7,12 @@ import {
   extractAuthHeaders,
   isValidStellarAddress,
   verifySignature,
+  AuthFailureTracker,
   MemoryNonceStore,
+  authStats,
+  getAuthStats,
+  resetAuthStats,
+  type AuthLogger,
   type NonceStore,
 } from '../src/auth.js'
 
@@ -16,7 +22,8 @@ import {
 // authenticateRequest (#70) blocks below landed with those issues; #72 adds
 // MemoryNonceStore, extractAuthHeaders, isValidStellarAddress, and the
 // characterization cases that pin exact behaviour (including anything that
-// looks off — noted, not fixed).
+// looks off — noted, not fixed). The AuthFailureTracker block covers the
+// per-address exponential-backoff brute-force protection (#183, #184).
 
 const keypair = Keypair.random()
 const G = keypair.publicKey()
@@ -31,6 +38,7 @@ function sign(nonce: string, address: string): string {
 const alwaysValidNonce: NonceStore = {
   issue: async () => 'n',
   consume: async () => true,
+  shutdown: async () => {},
 }
 
 describe('classifyStellarAddress', () => {
@@ -91,7 +99,7 @@ describe('authenticateRequest (issue #70)', () => {
 
   it('returns the authenticated address on success', async () => {
     const res = await authenticateRequest(headersFor(G), alwaysValidNonce)
-    expect(res).toEqual({ authenticated: true, address: G })
+    expect(res).toEqual({ authenticated: true, address: G, ed25519Address: G })
   })
 
   it('never carries an address on failure — the union makes it a type error to read one', async () => {
@@ -107,7 +115,7 @@ describe('authenticateRequest (issue #70)', () => {
   })
 
   it('keeps existing 401 behaviour for a bad nonce and a bad signature', async () => {
-    const rejectingNonce: NonceStore = { issue: async () => 'n', consume: async () => false }
+    const rejectingNonce: NonceStore = { issue: async () => 'n', consume: async () => false, shutdown: async () => {} }
     const badNonce = await authenticateRequest(headersFor(G), rejectingNonce)
     expect(badNonce).toMatchObject({ authenticated: false, status: 401 })
 
@@ -121,10 +129,10 @@ describe('authenticateRequest (issue #70)', () => {
     await store.shutdown()
   })
 
-  it('rejects a target-address mismatch (unchanged 401 behaviour)', async () => {
+  it('rejects a target-address mismatch with 403 — authenticated but not authorized (issue #134)', async () => {
     const other = Keypair.random().publicKey()
     const res = await authenticateRequest(headersFor(G), alwaysValidNonce, other)
-    expect(res).toMatchObject({ authenticated: false, status: 401 })
+    expect(res).toMatchObject({ authenticated: false, status: 403 })
   })
 })
 
@@ -133,13 +141,21 @@ describe('MemoryNonceStore (#72)', () => {
     vi.useRealTimers()
   })
 
-  it('issue() returns a distinct 64-hex value per call and per address', async () => {
+  it('issue() returns distinct nonces each time (issue #180)', async () => {
     const store = new MemoryNonceStore()
     const a1 = await store.issue('GA')
     const a2 = await store.issue('GA')
     const b1 = await store.issue('GB')
     for (const n of [a1, a2, b1]) expect(n).toMatch(/^[0-9a-f]{64}$/)
-    expect(new Set([a1, a2, b1]).size).toBe(3)
+    // Issue #180: a1 and a2 should be different to support independent sessions on separate devices
+    expect(a1).not.toBe(a2)
+    // b1 should also be different (different address)
+    expect(b1).not.toBe(a1)
+    expect(b1).not.toBe(a2)
+    // Both nonces should be valid for their respective addresses
+    expect(await store.consume('GA', a1)).toBe(true)
+    expect(await store.consume('GA', a2)).toBe(true)
+    expect(await store.consume('GB', b1)).toBe(true)
     await store.shutdown()
   })
 
@@ -182,6 +198,25 @@ describe('MemoryNonceStore (#72)', () => {
     vi.advanceTimersByTime(6 * 60 * 1000) // sweep runs every 60s; entry expires at 300s
     const internal = (store as unknown as { store: Map<string, unknown> }).store
     expect(internal.size).toBe(0)
+    await store.shutdown()
+  })
+
+  it('concurrent issue calls do not clobber each other (issue #179)', async () => {
+    const store = new MemoryNonceStore()
+
+    // Issue #180: support multiple nonces per address
+    const [nonce1, nonce2] = await Promise.all([
+      store.issue(G),
+      store.issue(G),
+    ])
+
+    // Both nonces should be distinct
+    expect(nonce1).not.toBe(nonce2)
+
+    // Both nonces should be valid
+    expect(await store.consume(G, nonce1)).toBe(true)
+    expect(await store.consume(G, nonce2)).toBe(true)
+
     await store.shutdown()
   })
 })
@@ -245,7 +280,19 @@ describe('authenticateRequest — characterization (#72)', () => {
     expect(await authenticateRequest(headersFor(G, nonce), store)).toEqual({
       authenticated: true,
       address: G,
+      ed25519Address: G,
     })
+    await store.shutdown()
+  })
+
+  it('issues 64-char nonces whose prefix round-trips the issue time', async () => {
+    const store = new MemoryNonceStore()
+    const before = Date.now()
+    const nonce = await store.issue(G)
+    const issuedAt = Number.parseInt(nonce.slice(0, 12), 16)
+    expect(nonce).toHaveLength(64)
+    expect(issuedAt).toBeGreaterThanOrEqual(before)
+    expect(issuedAt).toBeLessThanOrEqual(Date.now())
     await store.shutdown()
   })
 
@@ -254,7 +301,7 @@ describe('authenticateRequest — characterization (#72)', () => {
       error: 'Missing authentication headers',
     })
     expect(
-      await authenticateRequest(headersFor(G, 'n'), { issue: async () => 'n', consume: async () => false }),
+      await authenticateRequest(headersFor(G, 'n'), { issue: async () => 'n', consume: async () => false, shutdown: async () => {} }),
     ).toMatchObject({ error: 'Invalid or expired nonce' })
     expect(
       await authenticateRequest({ authorization: `StellarSignature ${G}:bm90LXNpZw:n` }, alwaysValidNonce),
@@ -277,13 +324,13 @@ describe('authenticateRequest — characterization (#72)', () => {
     const res = await authenticateRequest(headersFor(G, nonce), store, Keypair.random().publicKey())
     expect(res).toEqual({
       authenticated: false,
-      status: 401,
+      status: 403,
       error: 'Cannot modify notifications for another address',
     })
     await store.shutdown()
   })
 
-  it('pins current ordering: the nonce is consumed before the signature check, so a bad-signature request still spends its nonce', async () => {
+  it('verifies the signature before consuming the nonce, so a bad-signature request cannot burn a live challenge (issue #115)', async () => {
     const store = new MemoryNonceStore()
     const nonce = await store.issue(G)
     const first = await authenticateRequest(
@@ -291,8 +338,50 @@ describe('authenticateRequest — characterization (#72)', () => {
       store,
     )
     expect(first).toMatchObject({ authenticated: false, error: 'Invalid signature' })
+    // The nonce must still be valid after the failed signature check.
     const second = await authenticateRequest(headersFor(G, nonce), store)
-    expect(second).toMatchObject({ authenticated: false, error: 'Invalid or expired nonce' })
+    expect(second).toMatchObject({ authenticated: true, address: G })
+    await store.shutdown()
+  })
+})
+
+// Issue #372: the nonce lifetime is configurable (NONCE_TTL_MS ->
+// config.db.nonceTtlMs). authenticateRequest must follow it rather than a
+// hardcoded 5 minutes: a longer TTL keeps nonces valid past 5 minutes, and a
+// shorter TTL rejects them sooner.
+describe('authenticateRequest — configurable nonce TTL (#372)', () => {
+  const originalTtl = config.db.nonceTtlMs
+
+  afterEach(() => {
+    Object.assign(config.db, { nonceTtlMs: originalTtl })
+    vi.useRealTimers()
+  })
+
+  function headersFor(nonce: string): Record<string, unknown> {
+    return { authorization: `StellarSignature ${G}:${sign(nonce, G)}:${nonce}` }
+  }
+
+  it('accepts a nonce older than 5 minutes when NONCE_TTL_MS is longer', async () => {
+    vi.useFakeTimers()
+    Object.assign(config.db, { nonceTtlMs: 10 * 60 * 1000 })
+    const store = new MemoryNonceStore()
+    const nonce = await store.issue(G)
+    vi.advanceTimersByTime(6 * 60 * 1000)
+    expect(await authenticateRequest(headersFor(nonce), store)).toMatchObject({ authenticated: true, address: G })
+    await store.shutdown()
+  })
+
+  it('rejects a nonce younger than 5 minutes once a shorter NONCE_TTL_MS has passed', async () => {
+    vi.useFakeTimers()
+    Object.assign(config.db, { nonceTtlMs: 60 * 1000 })
+    const store = new MemoryNonceStore()
+    const nonce = await store.issue(G)
+    vi.advanceTimersByTime(2 * 60 * 1000)
+    expect(await authenticateRequest(headersFor(nonce), store)).toMatchObject({
+      authenticated: false,
+      status: 401,
+      error: 'Invalid or expired nonce',
+    })
     await store.shutdown()
   })
 })
